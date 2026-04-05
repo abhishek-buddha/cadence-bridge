@@ -201,6 +201,21 @@ function forwardToListeners(callId, payload, track) {
 }
 
 /**
+ * Broadcast any JSON message to all browser listeners for a given callId.
+ * Used for transcript events, phase changes, etc.
+ */
+function broadcastToListeners(callId, message) {
+  const listeners = browserListeners.get(callId);
+  if (!listeners || listeners.size === 0) return;
+  const msg = JSON.stringify(message);
+  for (const client of listeners) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+/**
  * Clean up all resources for a given callId.
  */
 function cleanupCall(callId) {
@@ -364,6 +379,26 @@ function handleMediaStream(ws) {
 
               // Forward to browser listeners
               forwardToListeners(callId, mulawAudio, "outbound");
+            } else if (elMsg.type === "agent_response" || elMsg.type === "agent_response_correction") {
+              // Forward agent transcript to browser listeners
+              const text = (elMsg.agent_response || "").trim();
+              if (text && callId) {
+                broadcastToListeners(callId, {
+                  event: "transcript",
+                  role: "agent",
+                  text,
+                });
+              }
+            } else if (elMsg.type === "user_transcript") {
+              // Forward user transcript to browser listeners
+              const text = (elMsg.user_transcript || "").trim();
+              if (text && callId) {
+                broadcastToListeners(callId, {
+                  event: "transcript",
+                  role: "user",
+                  text,
+                });
+              }
             } else if (elMsg.type === "interruption") {
               // Send clear event to Twilio to stop playing audio
               if (ws.readyState === WebSocket.OPEN && streamSid) {
