@@ -158,6 +158,87 @@ app.get("/health", (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /start-monitor — Connect to ElevenLabs conversation monitor WebSocket
+// and forward real-time events (user_transcript, agent_response, tool_call)
+// to Convex via the /call-events HTTP endpoint.
+// ---------------------------------------------------------------------------
+app.post("/start-monitor", express.json(), async (req, res) => {
+  const { conversationId, callId, convexSiteUrl } = req.body;
+  if (!conversationId || !callId) {
+    return res.status(400).json({ error: "Missing conversationId or callId" });
+  }
+
+  const targetConvexUrl = convexSiteUrl || CONVEX_SITE_URL;
+  console.log(`[rt-monitor] Starting monitor for conv=${conversationId} call=${callId} convex=${targetConvexUrl}`);
+
+  try {
+    const monitorUrl = `wss://api.elevenlabs.io/v1/convai/conversations/${conversationId}/monitor`;
+    const monitorWs = new WebSocket(monitorUrl, {
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    });
+
+    monitorWs.on("open", () => {
+      console.log(`[rt-monitor] Connected to ElevenLabs monitor for conv=${conversationId}`);
+    });
+
+    monitorWs.on("message", async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        let type = null;
+        let message = null;
+
+        if (msg.type === "user_transcript" || msg.type === "user_transcription_event") {
+          type = "user_transcript";
+          message = msg.user_transcription_event?.user_transcript || msg.user_transcript || "";
+        } else if (msg.type === "agent_response" || msg.type === "agent_response_event") {
+          type = "agent_response";
+          message = msg.agent_response_event?.agent_response || msg.agent_response || "";
+        } else if (msg.type === "tool_call" || msg.type === "client_tool_call") {
+          type = "tool_call";
+          message = msg.tool_name || msg.client_tool_call?.tool_name || "DTMF";
+        } else if (msg.type === "conversation_initiation_metadata") {
+          type = "status";
+          message = "Call connected";
+        }
+
+        if (type && targetConvexUrl) {
+          fetch(`${targetConvexUrl}/call-events`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ callId, type, message }),
+          }).catch((err) => {
+            console.error(`[rt-monitor] Failed to POST event to Convex:`, err.message);
+          });
+        }
+      } catch (parseErr) {
+        // Ignore unparseable messages
+      }
+    });
+
+    monitorWs.on("close", (code, reason) => {
+      console.log(`[rt-monitor] Monitor closed for conv=${conversationId}: ${code} ${reason}`);
+      // Send final "Call ended" event
+      if (targetConvexUrl) {
+        fetch(`${targetConvexUrl}/call-events`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ callId, type: "status", message: "Call ended" }),
+        }).catch(() => {});
+      }
+    });
+
+    monitorWs.on("error", (err) => {
+      console.error(`[rt-monitor] Monitor error for conv=${conversationId}:`, err.message);
+    });
+
+    res.json({ success: true, monitoring: conversationId });
+  } catch (err) {
+    console.error(`[rt-monitor] Failed to start:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // WebSocket server
 // ---------------------------------------------------------------------------
 const wss = new WebSocketServer({ server });
@@ -569,10 +650,11 @@ function handleListen(ws, callId) {
 server.listen(PORT, () => {
   console.log(`[cadence-bridge] Server listening on port ${PORT}`);
   console.log(`[cadence-bridge] Endpoints:`);
-  console.log(`  ws://localhost:${PORT}/media-stream  — Twilio <-> ElevenLabs relay`);
-  console.log(`  ws://localhost:${PORT}/monitor       — Twilio monitor stream`);
-  console.log(`  ws://localhost:${PORT}/listen/:callId — Browser audio listener`);
-  console.log(`  http://localhost:${PORT}/health       — Health check`);
+  console.log(`  ws://localhost:${PORT}/media-stream       — Twilio <-> ElevenLabs relay`);
+  console.log(`  ws://localhost:${PORT}/monitor            — Twilio monitor stream`);
+  console.log(`  ws://localhost:${PORT}/listen/:callId     — Browser audio listener`);
+  console.log(`  http://localhost:${PORT}/health            — Health check`);
+  console.log(`  POST http://localhost:${PORT}/start-monitor — Start ElevenLabs conversation monitor`);
   console.log(`[cadence-bridge] ElevenLabs Agent ID: ${ELEVENLABS_AGENT_ID || "(not set)"}`);
   console.log(`[cadence-bridge] Convex Site URL: ${CONVEX_SITE_URL || "(not set)"}`);
 });
