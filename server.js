@@ -325,16 +325,10 @@ function handleMediaStream(ws) {
           elevenLabsWs.on("open", () => {
             console.log(`[media-stream] ElevenLabs WebSocket connected for callId=${callId}`);
 
-            // Send initial configuration
+            // Send initial configuration — only dynamic variables, no prompt overrides
             const initMessage = {
               type: "conversation_initiation_client_data",
-              conversation_config_override: {
-                agent: {
-                  prompt: { prompt: "" },
-                  first_message: "",
-                },
-              },
-              dynamic_variables: metadata.dynamic_variables || metadata || {},
+              dynamic_variables: metadata.dynamic_variables || {},
             };
             elevenLabsWs.send(JSON.stringify(initMessage));
             console.log("[media-stream] Sent conversation init to ElevenLabs");
