@@ -28,116 +28,6 @@ const monitorStreams = new Map();
 let totalWsConnections = 0;
 
 // ---------------------------------------------------------------------------
-// Mu-law <-> PCM16 conversion + resampling
-// ---------------------------------------------------------------------------
-
-// Standard mu-law decoding table (256 entries, index = mu-law byte)
-const MULAW_DECODE_TABLE = new Int16Array([
-  -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
-  -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
-  -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
-  -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
-  -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
-  -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
-  -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
-  -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
-  -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
-  -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
-  -876, -844, -812, -780, -748, -716, -684, -652,
-  -620, -588, -556, -524, -492, -460, -428, -396,
-  -372, -356, -340, -324, -308, -292, -276, -260,
-  -244, -228, -212, -196, -180, -164, -148, -132,
-  -120, -112, -104, -96, -88, -80, -72, -64,
-  -56, -48, -40, -32, -24, -16, -8, 0,
-  32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
-  23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
-  15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
-  11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
-  7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
-  5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
-  3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
-  2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
-  1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
-  1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
-  876, 844, 812, 780, 748, 716, 684, 652,
-  620, 588, 556, 524, 492, 460, 428, 396,
-  372, 356, 340, 324, 308, 292, 276, 260,
-  244, 228, 212, 196, 180, 164, 148, 132,
-  120, 112, 104, 96, 88, 80, 72, 64,
-  56, 48, 40, 32, 24, 16, 8, 0,
-]);
-
-/**
- * Encode a single PCM16 sample to mu-law byte.
- */
-function pcm16ToMulaw(sample) {
-  const MULAW_MAX = 0x1fff;
-  const MULAW_BIAS = 33;
-  let sign = 0;
-  if (sample < 0) {
-    sign = 0x80;
-    sample = -sample;
-  }
-  if (sample > MULAW_MAX) sample = MULAW_MAX;
-  sample += MULAW_BIAS;
-
-  let exponent = 7;
-  let mask = 0x4000;
-  while (exponent > 0 && !(sample & mask)) {
-    exponent--;
-    mask >>= 1;
-  }
-  const mantissa = (sample >> (exponent + 3)) & 0x0f;
-  const mulawByte = ~(sign | (exponent << 4) | mantissa) & 0xff;
-  return mulawByte;
-}
-
-/**
- * Convert mu-law 8kHz base64 audio → PCM16 16kHz base64 audio.
- * Steps: decode mu-law → PCM16 8kHz → upsample 2x to 16kHz.
- */
-function mulawToPcm16(base64Mulaw) {
-  const mulawBuf = Buffer.from(base64Mulaw, "base64");
-  const sampleCount = mulawBuf.length;
-  // Upsample 2x: each input sample becomes 2 output samples (linear interpolation)
-  const pcm16Buf = Buffer.alloc(sampleCount * 2 * 2); // 2x samples, 2 bytes each
-
-  for (let i = 0; i < sampleCount; i++) {
-    const currentSample = MULAW_DECODE_TABLE[mulawBuf[i]];
-    const nextSample =
-      i + 1 < sampleCount
-        ? MULAW_DECODE_TABLE[mulawBuf[i + 1]]
-        : currentSample;
-    const midSample = (currentSample + nextSample) >> 1;
-
-    // Write two samples (little-endian 16-bit)
-    pcm16Buf.writeInt16LE(currentSample, i * 4);
-    pcm16Buf.writeInt16LE(midSample, i * 4 + 2);
-  }
-
-  return pcm16Buf.toString("base64");
-}
-
-/**
- * Convert PCM16 16kHz base64 audio → mu-law 8kHz base64 audio.
- * Steps: downsample 2x (take every other sample) → encode mu-law.
- */
-function pcm16ToMulawBuffer(base64Pcm16) {
-  const pcmBuf = Buffer.from(base64Pcm16, "base64");
-  const totalSamples = pcmBuf.length / 2;
-  // Downsample 2x
-  const outputSamples = Math.floor(totalSamples / 2);
-  const mulawBuf = Buffer.alloc(outputSamples);
-
-  for (let i = 0; i < outputSamples; i++) {
-    const sample = pcmBuf.readInt16LE(i * 4); // skip every other sample
-    mulawBuf[i] = pcm16ToMulaw(sample);
-  }
-
-  return mulawBuf.toString("base64");
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -170,7 +60,7 @@ async function fetchCallMetadata(callId) {
  * Get a signed URL from ElevenLabs for the conversational AI WebSocket.
  */
 async function getElevenLabsSignedUrl() {
-  const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${ELEVENLABS_AGENT_ID}`;
+  const url = `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`;
   const res = await fetch(url, {
     method: "GET",
     headers: { "xi-api-key": ELEVENLABS_API_KEY },
@@ -277,18 +167,182 @@ wss.on("connection", (ws, req) => {
 
 // ---------------------------------------------------------------------------
 // /media-stream — Bidirectional Twilio <-> ElevenLabs relay
+//
+// Follows the nibodev/elevenlabs-twilio-i-o reference pattern:
+//   1. ElevenLabs connection starts IMMEDIATELY on Twilio WS open
+//   2. Audio pass-through with NO conversion, NO batching
+//   3. Init message sent after metadata arrives from Convex
 // ---------------------------------------------------------------------------
 function handleMediaStream(ws) {
   console.log("[media-stream] New Twilio connection");
 
   let streamSid = null;
   let callId = null;
-  let claimId = null;
   let elevenLabsWs = null;
-  let elevenLabsReady = false;
-  let pendingAudioChunks = []; // Buffer audio while ElevenLabs connects
-  let audioAccumulator = []; // Accumulate Twilio chunks for batched sending
+  let elevenLabsConnected = false; // true once ElevenLabs WS is OPEN
+  let pendingInitMessage = null;   // queued init message if metadata arrives before EL connects
 
+  // ------------------------------------------------------------------
+  // Set up ElevenLabs connection IMMEDIATELY (don't wait for "start")
+  // ------------------------------------------------------------------
+  const setupElevenLabs = async () => {
+    try {
+      console.log("[media-stream] Getting ElevenLabs signed URL...");
+      const signedUrl = await getElevenLabsSignedUrl();
+      console.log("[media-stream] Got signed URL, connecting to ElevenLabs...");
+
+      elevenLabsWs = new WebSocket(signedUrl);
+
+      elevenLabsWs.on("open", () => {
+        console.log("[media-stream] ElevenLabs WebSocket connected");
+        elevenLabsConnected = true;
+
+        // If we already have the init message queued (metadata fetched before EL connected), send it now
+        if (pendingInitMessage) {
+          console.log("[media-stream] Sending queued init message to ElevenLabs");
+          elevenLabsWs.send(JSON.stringify(pendingInitMessage));
+          pendingInitMessage = null;
+        }
+
+        // Update the active call reference if callId is already known
+        if (callId) {
+          const callEntry = activeCalls.get(callId);
+          if (callEntry) {
+            callEntry.elevenLabsWs = elevenLabsWs;
+          }
+        }
+      });
+
+      elevenLabsWs.on("message", (data) => {
+        let message;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+
+        switch (message.type) {
+          case "conversation_initiation_metadata":
+            console.log(`[ElevenLabs] Received conversation initiation metadata`);
+            break;
+
+          case "audio":
+            // Check BOTH audio.chunk AND audio_event.audio_base_64 (reference pattern)
+            if (message.audio?.chunk) {
+              // Send directly to Twilio — NO conversion
+              if (ws.readyState === WebSocket.OPEN && streamSid) {
+                ws.send(JSON.stringify({
+                  event: "media",
+                  streamSid,
+                  media: { payload: message.audio.chunk },
+                }));
+              }
+              // Forward to browser listeners
+              if (callId) {
+                forwardToListeners(callId, message.audio.chunk, "outbound");
+              }
+            } else if (message.audio_event?.audio_base_64) {
+              // Send directly to Twilio — NO conversion
+              if (ws.readyState === WebSocket.OPEN && streamSid) {
+                ws.send(JSON.stringify({
+                  event: "media",
+                  streamSid,
+                  media: { payload: message.audio_event.audio_base_64 },
+                }));
+              }
+              // Forward to browser listeners
+              if (callId) {
+                forwardToListeners(callId, message.audio_event.audio_base_64, "outbound");
+              }
+            } else {
+              console.log("[ElevenLabs] Received audio but no StreamSid yet");
+            }
+            break;
+
+          case "interruption":
+            if (ws.readyState === WebSocket.OPEN && streamSid) {
+              ws.send(JSON.stringify({ event: "clear", streamSid }));
+            }
+            break;
+
+          case "ping":
+            // Reference uses message.ping_event?.event_id
+            if (message.ping_event?.event_id) {
+              if (elevenLabsWs.readyState === WebSocket.OPEN) {
+                elevenLabsWs.send(JSON.stringify({
+                  type: "pong",
+                  event_id: message.ping_event.event_id,
+                }));
+              }
+            }
+            break;
+
+          case "user_transcript": {
+            // Reference uses message.user_transcription_event?.user_transcript
+            const text = (message.user_transcription_event?.user_transcript || "").trim();
+            if (text) {
+              console.log(`[User] ${text}`);
+              if (callId) {
+                broadcastToListeners(callId, {
+                  event: "transcript",
+                  role: "user",
+                  text,
+                });
+              }
+            }
+            break;
+          }
+
+          case "agent_response":
+          case "agent_response_correction": {
+            // Reference uses message.agent_response_event?.agent_response
+            const text = (message.agent_response_event?.agent_response || "").trim();
+            if (text) {
+              console.log(`[Agent] ${text}`);
+              if (callId) {
+                broadcastToListeners(callId, {
+                  event: "transcript",
+                  role: "agent",
+                  text,
+                });
+              }
+            }
+            break;
+          }
+
+          default:
+            console.log(`[ElevenLabs] Unhandled message type: ${message.type}`);
+            break;
+        }
+      });
+
+      elevenLabsWs.on("error", (err) => {
+        console.error(`[ElevenLabs] WebSocket error:`, err.message);
+      });
+
+      elevenLabsWs.on("close", (code, reason) => {
+        console.log(`[ElevenLabs] Disconnected: ${code} ${reason}`);
+        elevenLabsConnected = false;
+        // Close Twilio side too
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+        if (callId) {
+          cleanupCall(callId);
+        }
+      });
+    } catch (err) {
+      console.error(`[media-stream] Failed to set up ElevenLabs:`, err.message);
+      ws.close();
+    }
+  };
+
+  // Start ElevenLabs connection IMMEDIATELY — matches reference pattern
+  setupElevenLabs();
+
+  // ------------------------------------------------------------------
+  // Handle messages from Twilio
+  // ------------------------------------------------------------------
   ws.on("message", async (data) => {
     let msg;
     try {
@@ -298,178 +352,72 @@ function handleMediaStream(ws) {
     }
 
     switch (msg.event) {
-      case "connected":
-        console.log("[media-stream] Twilio connected");
-        break;
-
       case "start":
         streamSid = msg.start.streamSid;
         const customParams = msg.start.customParameters || {};
         callId = customParams.callId || `unknown-${Date.now()}`;
-        claimId = customParams.claimId || null;
-        console.log(`[media-stream] Stream started — streamSid=${streamSid}, callId=${callId}, claimId=${claimId}`);
+        const claimId = customParams.claimId || null;
+        console.log(`[Twilio] Stream started — streamSid=${streamSid}, callId=${callId}, claimId=${claimId}`);
 
         // Store the active call
-        activeCalls.set(callId, { twilioWs: ws, elevenLabsWs: null, streamSid });
+        activeCalls.set(callId, { twilioWs: ws, elevenLabsWs, streamSid });
 
-        // Fetch metadata and connect to ElevenLabs
+        // Fetch metadata from Convex then send init to ElevenLabs
         try {
           const metadata = await fetchCallMetadata(callId);
+          const initMessage = {
+            type: "conversation_initiation_client_data",
+            dynamic_variables: metadata.dynamic_variables || {},
+          };
 
-          // Get signed URL from ElevenLabs
-          console.log("[media-stream] Getting ElevenLabs signed URL...");
-          const signedUrl = await getElevenLabsSignedUrl();
-          console.log("[media-stream] Got signed URL, connecting to ElevenLabs...");
-
-          elevenLabsWs = new WebSocket(signedUrl);
-
-          elevenLabsWs.on("open", () => {
-            console.log(`[media-stream] ElevenLabs WebSocket connected for callId=${callId}`);
-
-            // Send initial configuration — dynamic variables only, NO overrides
-            // The agent's overrides config has prompt:false so any override is rejected
-            const initMessage = {
-              type: "conversation_initiation_client_data",
-              dynamic_variables: metadata.dynamic_variables || {},
-            };
+          if (elevenLabsConnected && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+            // ElevenLabs already connected — send init now
+            console.log("[media-stream] Sending init message to ElevenLabs");
             elevenLabsWs.send(JSON.stringify(initMessage));
-            console.log("[media-stream] Sent conversation init to ElevenLabs");
-
-            // Mark ready immediately — reference implementation doesn't wait for metadata
-            elevenLabsReady = true;
-            pendingAudioChunks = [];
-
-            // Update the active call reference
-            const callEntry = activeCalls.get(callId);
-            if (callEntry) {
-              callEntry.elevenLabsWs = elevenLabsWs;
-            }
-          });
-
-          elevenLabsWs.on("message", (elData) => {
-            let elMsg;
-            try {
-              elMsg = JSON.parse(elData.toString());
-            } catch {
-              return;
-            }
-
-            // ElevenLabs ready signal — now we can start sending audio
-            if (elMsg.type === "conversation_initiation_metadata") {
-              console.log(`[media-stream] ElevenLabs ready for callId=${callId} — dropping ${pendingAudioChunks.length} pre-ready chunks`);
-              elevenLabsReady = true;
-              pendingAudioChunks = []; // Drop pre-ready audio, only forward new audio from here
-            } else if (elMsg.type === "audio" && elMsg.audio && elMsg.audio.chunk) {
-              // ElevenLabs sends PCM16 16kHz, convert to mu-law 8kHz for Twilio
-              const mulawAudio = pcm16ToMulawBuffer(elMsg.audio.chunk);
-
-              // Send to Twilio
-              if (ws.readyState === WebSocket.OPEN && streamSid) {
-                ws.send(
-                  JSON.stringify({
-                    event: "media",
-                    streamSid,
-                    media: { payload: mulawAudio },
-                  })
-                );
-              }
-
-              // Forward to browser listeners
-              forwardToListeners(callId, mulawAudio, "outbound");
-            } else if (elMsg.type === "agent_response" || elMsg.type === "agent_response_correction") {
-              // Forward agent transcript to browser listeners
-              const text = (elMsg.agent_response || "").trim();
-              if (text && callId) {
-                broadcastToListeners(callId, {
-                  event: "transcript",
-                  role: "agent",
-                  text,
-                });
-              }
-            } else if (elMsg.type === "user_transcript") {
-              // Forward user transcript to browser listeners
-              const text = (elMsg.user_transcript || "").trim();
-              if (text && callId) {
-                broadcastToListeners(callId, {
-                  event: "transcript",
-                  role: "user",
-                  text,
-                });
-              }
-            } else if (elMsg.type === "interruption") {
-              // Send clear event to Twilio to stop playing audio
-              if (ws.readyState === WebSocket.OPEN && streamSid) {
-                ws.send(JSON.stringify({ event: "clear", streamSid }));
-              }
-            } else if (elMsg.type === "ping") {
-              // Respond to ElevenLabs ping with pong
-              if (elevenLabsWs.readyState === WebSocket.OPEN) {
-                elevenLabsWs.send(
-                  JSON.stringify({ type: "pong", event_id: elMsg.event_id })
-                );
-              }
-            }
-          });
-
-          elevenLabsWs.on("error", (err) => {
-            console.error(`[media-stream] ElevenLabs WS error for callId=${callId}:`, err.message);
-          });
-
-          elevenLabsWs.on("close", (code, reason) => {
-            console.log(`[media-stream] ElevenLabs WS closed for callId=${callId}: ${code} ${reason}`);
-            elevenLabsReady = false;
-            // Close Twilio side too
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
-            cleanupCall(callId);
-          });
+          } else {
+            // ElevenLabs not connected yet — queue it
+            console.log("[media-stream] ElevenLabs not ready yet, queuing init message");
+            pendingInitMessage = initMessage;
+          }
         } catch (err) {
-          console.error(`[media-stream] Failed to connect to ElevenLabs for callId=${callId}:`, err.message);
-          ws.close();
-          cleanupCall(callId);
+          console.error(`[media-stream] Metadata fetch failed:`, err.message);
+          // Send init with empty dynamic_variables anyway so ElevenLabs starts
+          const initMessage = {
+            type: "conversation_initiation_client_data",
+            dynamic_variables: {},
+          };
+          if (elevenLabsConnected && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+            elevenLabsWs.send(JSON.stringify(initMessage));
+          } else {
+            pendingInitMessage = initMessage;
+          }
         }
         break;
 
       case "media":
-        if (msg.media && msg.media.payload) {
-          // Accumulate Twilio chunks and send in batches
-          // Twilio sends 160-byte chunks every 20ms (50/sec) — too fast for ElevenLabs
-          // Batch 8 chunks (~160ms, ~1280 bytes) before sending
-          if (!audioAccumulator) audioAccumulator = [];
-          audioAccumulator.push(Buffer.from(msg.media.payload, "base64"));
+        // Pass audio straight through to ElevenLabs — NO conversion, NO batching
+        // Exactly matches reference: Buffer.from(payload, "base64").toString("base64")
+        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+          const audioMessage = {
+            user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
+          };
+          elevenLabsWs.send(JSON.stringify(audioMessage));
+        }
 
-          if (audioAccumulator.length >= 8) {
-            const combined = Buffer.concat(audioAccumulator);
-            audioAccumulator = [];
-
-            if (elevenLabsReady && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-              elevenLabsWs.send(JSON.stringify({ user_audio_chunk: combined.toString("base64") }));
-            }
-          }
-
-          // Keep this for non-ElevenLabs buffering
-          if (!elevenLabsReady) {
-            pendingAudioChunks.push(msg.media.payload);
-            // Cap buffer at ~5 seconds of audio (8000 samples/s * 5s / 160 samples per chunk ~ 250 chunks)
-            if (pendingAudioChunks.length > 250) {
-              pendingAudioChunks.shift();
-            }
-          }
-
-          // Forward to browser listeners (inbound track)
-          if (callId) {
-            forwardToListeners(callId, msg.media.payload, "inbound");
-          }
+        // Forward to browser listeners (inbound track)
+        if (callId) {
+          forwardToListeners(callId, msg.media.payload, "inbound");
         }
         break;
 
       case "stop":
-        console.log(`[media-stream] Twilio stream stopped for callId=${callId}`);
-        if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+        console.log(`[Twilio] Stream stopped for callId=${callId}`);
+        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
           elevenLabsWs.close();
         }
-        cleanupCall(callId);
+        if (callId) {
+          cleanupCall(callId);
+        }
         break;
 
       default:
@@ -479,7 +427,7 @@ function handleMediaStream(ws) {
 
   ws.on("close", () => {
     console.log(`[media-stream] Twilio WS closed for callId=${callId}`);
-    if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+    if (elevenLabsWs?.readyState === WebSocket.OPEN) {
       elevenLabsWs.close();
     }
     if (callId) {
