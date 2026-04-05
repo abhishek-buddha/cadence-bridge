@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cadence-bridge
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: "3001"
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_AGENT_ID
+        sync: false
+      - key: CONVEX_SITE_URL
+        sync: false
