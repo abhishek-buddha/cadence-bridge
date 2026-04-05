@@ -287,8 +287,7 @@ function handleMediaStream(ws) {
   let elevenLabsWs = null;
   let elevenLabsReady = false;
   let pendingAudioChunks = []; // Buffer audio while ElevenLabs connects
-  let pcmBuffer = []; // Buffer PCM16 chunks for batched sending
-  let pcmBufferBytes = 0;
+  let audioAccumulator = []; // Accumulate Twilio chunks for batched sending
 
   ws.on("message", async (data) => {
     let msg;
@@ -327,12 +326,11 @@ function handleMediaStream(ws) {
           elevenLabsWs.on("open", () => {
             console.log(`[media-stream] ElevenLabs WebSocket connected for callId=${callId}`);
 
-            // Send initial configuration with dynamic variables
-            // Include empty conversation_config_override to signal Twilio audio format
+            // Send initial configuration — dynamic variables only, NO overrides
+            // The agent's overrides config has prompt:false so any override is rejected
             const initMessage = {
               type: "conversation_initiation_client_data",
               dynamic_variables: metadata.dynamic_variables || {},
-              conversation_config_override: {},
             };
             elevenLabsWs.send(JSON.stringify(initMessage));
             console.log("[media-stream] Sent conversation init to ElevenLabs");
@@ -435,14 +433,23 @@ function handleMediaStream(ws) {
 
       case "media":
         if (msg.media && msg.media.payload) {
-          // Send audio directly to ElevenLabs — same as reference implementation
-          // No format conversion — raw Twilio mulaw base64 pass-through
-          if (elevenLabsReady && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-            const audioMessage = {
-              user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
-            };
-            elevenLabsWs.send(JSON.stringify(audioMessage));
-          } else {
+          // Accumulate Twilio chunks and send in batches
+          // Twilio sends 160-byte chunks every 20ms (50/sec) — too fast for ElevenLabs
+          // Batch 8 chunks (~160ms, ~1280 bytes) before sending
+          if (!audioAccumulator) audioAccumulator = [];
+          audioAccumulator.push(Buffer.from(msg.media.payload, "base64"));
+
+          if (audioAccumulator.length >= 8) {
+            const combined = Buffer.concat(audioAccumulator);
+            audioAccumulator = [];
+
+            if (elevenLabsReady && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              elevenLabsWs.send(JSON.stringify({ user_audio_chunk: combined.toString("base64") }));
+            }
+          }
+
+          // Keep this for non-ElevenLabs buffering
+          if (!elevenLabsReady) {
             pendingAudioChunks.push(msg.media.payload);
             // Cap buffer at ~5 seconds of audio (8000 samples/s * 5s / 160 samples per chunk ~ 250 chunks)
             if (pendingAudioChunks.length > 250) {
