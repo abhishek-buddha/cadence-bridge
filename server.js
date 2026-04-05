@@ -119,6 +119,25 @@ function cleanupCall(callId) {
     }
     activeCalls.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up`);
+
+    // Notify Convex that the call ended so it doesn't stay stuck as in_progress
+    if (CONVEX_SITE_URL && callId) {
+      notifyCallEnded(callId).catch((err) =>
+        console.error(`[cleanup] Failed to notify Convex:`, err.message)
+      );
+    }
+  }
+}
+
+/**
+ * Notify Convex that a call has ended by calling the call-ended HTTP endpoint.
+ */
+async function notifyCallEnded(callId) {
+  const url = `${CONVEX_SITE_URL}/call-ended?callId=${encodeURIComponent(callId)}`;
+  console.log(`[cleanup] Notifying Convex call ended: ${callId}`);
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    console.error(`[cleanup] Convex call-ended returned ${res.status}`);
   }
 }
 
