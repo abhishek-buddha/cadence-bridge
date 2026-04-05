@@ -172,7 +172,7 @@ async function fetchCallMetadata(callId) {
 async function getElevenLabsSignedUrl() {
   const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${ELEVENLABS_AGENT_ID}`;
   const res = await fetch(url, {
-    method: "POST",
+    method: "GET",
     headers: { "xi-api-key": ELEVENLABS_API_KEY },
   });
   if (!res.ok) {
