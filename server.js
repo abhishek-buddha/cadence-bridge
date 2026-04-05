@@ -327,13 +327,19 @@ function handleMediaStream(ws) {
           elevenLabsWs.on("open", () => {
             console.log(`[media-stream] ElevenLabs WebSocket connected for callId=${callId}`);
 
-            // Send initial configuration — only dynamic variables, no prompt overrides
+            // Send initial configuration with dynamic variables
+            // Include empty conversation_config_override to signal Twilio audio format
             const initMessage = {
               type: "conversation_initiation_client_data",
               dynamic_variables: metadata.dynamic_variables || {},
+              conversation_config_override: {},
             };
             elevenLabsWs.send(JSON.stringify(initMessage));
-            console.log("[media-stream] Sent conversation init to ElevenLabs — waiting for metadata response before sending audio");
+            console.log("[media-stream] Sent conversation init to ElevenLabs");
+
+            // Mark ready immediately — reference implementation doesn't wait for metadata
+            elevenLabsReady = true;
+            pendingAudioChunks = [];
 
             // Update the active call reference
             const callEntry = activeCalls.get(callId);
@@ -429,26 +435,15 @@ function handleMediaStream(ws) {
 
       case "media":
         if (msg.media && msg.media.payload) {
-          // Convert Twilio mulaw 8kHz → PCM16 16kHz for ElevenLabs
-          // ElevenLabs expects PCM16 mono 16kHz, recommended ~4000 samples per chunk
-          const pcm16Chunk = mulawToPcm16(msg.media.payload);
-
+          // Send audio directly to ElevenLabs — same as reference implementation
+          // No format conversion — raw Twilio mulaw base64 pass-through
           if (elevenLabsReady && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-            // Buffer PCM16 chunks and send in ~250ms batches (4000 samples = 8000 bytes)
-            if (!pcmBuffer) pcmBuffer = [];
-            pcmBuffer.push(pcm16Chunk);
-            pcmBufferBytes += Buffer.from(pcm16Chunk, "base64").length;
-
-            if (pcmBufferBytes >= 8000) {
-              // Concatenate buffered chunks and send as one
-              const combined = Buffer.concat(pcmBuffer.map(c => Buffer.from(c, "base64")));
-              elevenLabsWs.send(JSON.stringify({ user_audio_chunk: combined.toString("base64") }));
-              pcmBuffer = [];
-              pcmBufferBytes = 0;
-            }
+            const audioMessage = {
+              user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
+            };
+            elevenLabsWs.send(JSON.stringify(audioMessage));
           } else {
-            // Buffer while waiting for ElevenLabs connection
-            pendingAudioChunks.push(pcm16Chunk);
+            pendingAudioChunks.push(msg.media.payload);
             // Cap buffer at ~5 seconds of audio (8000 samples/s * 5s / 160 samples per chunk ~ 250 chunks)
             if (pendingAudioChunks.length > 250) {
               pendingAudioChunks.shift();
