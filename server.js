@@ -427,14 +427,14 @@ function handleMediaStream(ws) {
 
       case "media":
         if (msg.media && msg.media.payload) {
-          // Convert Twilio mu-law 8kHz to PCM16 16kHz for ElevenLabs
-          const pcm16Audio = mulawToPcm16(msg.media.payload);
+          // Send Twilio mulaw audio directly — ElevenLabs accepts mulaw 8kHz natively
+          const audioChunk = msg.media.payload;
 
           if (elevenLabsReady && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-            elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcm16Audio }));
+            elevenLabsWs.send(JSON.stringify({ user_audio_chunk: audioChunk }));
           } else {
             // Buffer while waiting for ElevenLabs connection
-            pendingAudioChunks.push(pcm16Audio);
+            pendingAudioChunks.push(audioChunk);
             // Cap buffer at ~5 seconds of audio (8000 samples/s * 5s / 160 samples per chunk ~ 250 chunks)
             if (pendingAudioChunks.length > 250) {
               pendingAudioChunks.shift();
