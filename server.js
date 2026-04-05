@@ -350,14 +350,9 @@ function handleMediaStream(ws) {
 
             // ElevenLabs ready signal — now we can start sending audio
             if (elMsg.type === "conversation_initiation_metadata") {
-              console.log(`[media-stream] ElevenLabs ready for callId=${callId} — flushing ${pendingAudioChunks.length} buffered chunks`);
+              console.log(`[media-stream] ElevenLabs ready for callId=${callId} — dropping ${pendingAudioChunks.length} pre-ready chunks`);
               elevenLabsReady = true;
-
-              // Flush any buffered audio
-              for (const chunk of pendingAudioChunks) {
-                elevenLabsWs.send(JSON.stringify({ user_audio_chunk: chunk }));
-              }
-              pendingAudioChunks = [];
+              pendingAudioChunks = []; // Drop pre-ready audio, only forward new audio from here
             } else if (elMsg.type === "audio" && elMsg.audio && elMsg.audio.chunk) {
               // ElevenLabs sends PCM16 16kHz, convert to mu-law 8kHz for Twilio
               const mulawAudio = pcm16ToMulawBuffer(elMsg.audio.chunk);
