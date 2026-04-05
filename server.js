@@ -201,6 +201,7 @@ app.post("/start-monitor", express.json(), async (req, res) => {
           message = "Call connected";
         }
 
+        if (type) receivedAnyEvent = true;
         if (type && targetConvexUrl) {
           fetch(`${targetConvexUrl}/call-events`, {
             method: "POST",
@@ -215,10 +216,14 @@ app.post("/start-monitor", express.json(), async (req, res) => {
       }
     });
 
+    let receivedAnyEvent = false;
+
     monitorWs.on("close", (code, reason) => {
-      console.log(`[rt-monitor] Monitor closed for conv=${conversationId}: ${code} ${reason}`);
-      // Send final "Call ended" event
-      if (targetConvexUrl) {
+      const reasonStr = reason?.toString() || '';
+      console.log(`[rt-monitor] Monitor closed for conv=${conversationId}: ${code} ${reasonStr}`);
+      // Only send "Call ended" if we actually received events (monitoring was working)
+      // Don't send it if monitoring was rejected (1008) — that's not a real call end
+      if (targetConvexUrl && receivedAnyEvent && code !== 1008) {
         fetch(`${targetConvexUrl}/call-events`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
