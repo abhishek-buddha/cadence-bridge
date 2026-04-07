@@ -187,6 +187,16 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         let type = null;
         let message = null;
 
+        // Forward audio events to browser listeners
+        if (msg.type === "audio" || msg.type === "audio_event") {
+          receivedAnyEvent = true;
+          const audioData = msg.audio?.chunk || msg.audio_event?.audio_base_64 || msg.audio?.data || msg.data;
+          if (audioData) {
+            forwardToListeners(callId, audioData, "outbound");
+          }
+          return; // Don't forward audio as a call event
+        }
+
         if (msg.type === "user_transcript" || msg.type === "user_transcription_event") {
           type = "user_transcript";
           message = msg.user_transcription_event?.user_transcript || msg.user_transcript || "";
@@ -199,6 +209,9 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         } else if (msg.type === "conversation_initiation_metadata") {
           type = "status";
           message = "Call connected";
+        } else {
+          // Log unhandled event types for debugging
+          console.log(`[rt-monitor] Unhandled event type: ${msg.type} keys: ${Object.keys(msg).join(",")}`);
         }
 
         if (type) receivedAnyEvent = true;
@@ -212,7 +225,12 @@ app.post("/start-monitor", express.json(), async (req, res) => {
           });
         }
       } catch (parseErr) {
-        // Ignore unparseable messages
+        // Log binary/unparseable messages (could be raw audio)
+        if (data instanceof Buffer && data.length > 100) {
+          // Likely raw audio — forward as base64
+          forwardToListeners(callId, data.toString("base64"), "outbound");
+          receivedAnyEvent = true;
+        }
       }
     });
 
