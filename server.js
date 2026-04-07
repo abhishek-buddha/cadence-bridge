@@ -76,9 +76,14 @@ async function getElevenLabsSignedUrl() {
 /**
  * Forward audio chunk to all browser listeners for a given callId.
  */
+let audioChunkCount = 0;
 function forwardToListeners(callId, payload, track) {
   const listeners = browserListeners.get(callId);
   if (!listeners || listeners.size === 0) return;
+  audioChunkCount++;
+  if (audioChunkCount % 100 === 1) {
+    console.log(`[audio] Forwarding chunk #${audioChunkCount} to ${listeners.size} listener(s) for callId=${callId} track=${track} payload_len=${payload?.length || 0}`);
+  }
   const msg = JSON.stringify({
     event: "audio",
     media: { payload, track },
