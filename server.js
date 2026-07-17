@@ -28,6 +28,10 @@ const monitorStreams = new Map();
 // (one-shot guard so we don't re-notify on every subsequent IVR line).
 const handoffFired = new Map();
 
+// callId -> true after the IVR says it is transferring/holding for a rep.
+// Once armed, the next non-IVR human-like utterance triggers handoff.
+const handoffArmed = new Map();
+
 // All WebSocket connections for counting
 let totalWsConnections = 0;
 
@@ -60,6 +64,9 @@ const NON_HUMAN_HANDOFF_PHRASES = [
   "hold music",
   "at the tone",
   "record your message",
+  "continued patience",
+  "unable to reach",
+  "try again later",
   "voicemail",
 ];
 
@@ -82,6 +89,10 @@ const IVR_MENU_PHRASES = [
 ];
 
 const LIVE_HUMAN_PATTERNS = [
+  /\bhi\b.*\bhello\b/i,
+  /\bhello\b/i,
+  /\brecord your name\b/i,
+  /\breason for calling\b/i,
   /\bthis is [a-z][a-z .'-]{1,40}\b/i,
   /\bhow (can|may) i help\b/i,
   /\bhow can i assist\b/i,
@@ -92,13 +103,47 @@ const LIVE_HUMAN_PATTERNS = [
   /\brepresentative\b.*\b(help|assist|speaking)\b/i,
   /\bthanks? (so much )?for holding\b/i,
 ];
+function isTransferOrHoldCue(t) {
+  return [
+    "please hold",
+    "transferring you",
+    "transfer you",
+    "connecting you",
+    "next available representative",
+    "next available agent",
+    "hold while we transfer",
+    "please stay on the line",
+    "continued patience",
+  ].some((p) => t.includes(p));
+}
 
-function textSignalsHandoff(text) {
-  const t = (text || "").toLowerCase();
-  if (!t) return false;
+function isSilenceTranscript(t) {
+  return !t || t === "..." || t === "." || t === "[silence]";
+}
+
+function textSignalsHandoff(callId, text) {
+  const raw = (text || "").trim();
+  const t = raw.toLowerCase();
+  if (isSilenceTranscript(t)) return false;
+
+  if (isTransferOrHoldCue(t)) {
+    if (callId) handoffArmed.set(callId, true);
+    return false;
+  }
+
   if (NON_HUMAN_HANDOFF_PHRASES.some((p) => t.includes(p))) return false;
   if (IVR_MENU_PHRASES.some((p) => t.includes(p))) return false;
-  return LIVE_HUMAN_PATTERNS.some((p) => p.test(text));
+
+  if (LIVE_HUMAN_PATTERNS.some((p) => p.test(raw))) return true;
+
+  // After the IVR has announced a transfer, the first remaining non-IVR speech
+  // is treated as the answered party. This catches call-screening greetings and
+  // short human openings before the AI starts the claim conversation.
+  if (callId && handoffArmed.get(callId)) {
+    return /\b(hi|hello|yes|yeah|speaking|available)\b/i.test(raw);
+  }
+
+  return false;
 }
 async function fireHandoff(callId, convexSiteUrl, reasonText) {
   if (!callId || !convexSiteUrl) return;
@@ -113,7 +158,8 @@ async function fireHandoff(callId, convexSiteUrl, reasonText) {
     console.log(`[handoff] /twilio-request-handoff → ${res.status}`);
   } catch (err) {
     console.error(`[handoff] Failed to fire handoff:`, err.message);
-    handoffFired.delete(callId); // allow a retry on the next matching line
+    handoffFired.delete(callId);
+    handoffArmed.delete(callId); // allow a retry on the next matching line
   }
 }
 
@@ -216,6 +262,7 @@ function cleanupCall(callId) {
     const wasHandoff = handoffFired.get(callId) ? true : false;
     activeCalls.delete(callId);
     handoffFired.delete(callId);
+    handoffArmed.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
     // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
@@ -521,7 +568,7 @@ function handleMediaStream(ws) {
                 // The payer IVR/rep speech comes through as "user". If it
                 // signals a live-rep handoff, notify Convex to broadcast the
                 // call to our agent pool (the AI stays silent per its prompt).
-                if (textSignalsHandoff(text)) {
+                if (textSignalsHandoff(callId, text)) {
                   fireHandoff(callId, CONVEX_SITE_URL, text);
                 }
               }
