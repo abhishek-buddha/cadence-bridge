@@ -24,8 +24,62 @@ const browserListeners = new Map();
 // callId -> Set<WebSocket>  (monitor sources — Twilio unidirectional streams)
 const monitorStreams = new Map();
 
+// callId -> true once we've fired the human-handoff broadcast for this call
+// (one-shot guard so we don't re-notify on every subsequent IVR line).
+const handoffFired = new Map();
+
 // All WebSocket connections for counting
 let totalWsConnections = 0;
+
+// ---------------------------------------------------------------------------
+// Human-handoff detection (Option 1: Cadence owns the call).
+//
+// The agent prompt no longer ends the call at handoff — it goes silent. So the
+// BRIDGE detects the moment the payer IVR is about to connect a live rep, by
+// matching the IVR's spoken text, and fires Convex /twilio-request-handoff.
+// Convex then flips the call to awaiting_human and broadcasts it to our agent
+// pool. When an agent accepts, Convex redirects the payer leg into a conference
+// (closing THIS media stream → the AI is dropped) and the human takes over.
+// ---------------------------------------------------------------------------
+const HANDOFF_PHRASES = [
+  "please hold",
+  "transferring you",
+  "transfer you",
+  "connecting you",
+  "next available representative",
+  "next available agent",
+  "next available claims",
+  "one moment while",
+  "let me get someone",
+  "let me connect you",
+  "connect you to a representative",
+  "connect you with a representative",
+  "connecting you to the next",
+  "hold while we transfer",
+  "please stay on the line",
+];
+
+function textSignalsHandoff(text) {
+  const t = (text || "").toLowerCase();
+  return HANDOFF_PHRASES.some((p) => t.includes(p));
+}
+
+async function fireHandoff(callId, convexSiteUrl, reasonText) {
+  if (!callId || !convexSiteUrl) return;
+  if (handoffFired.get(callId)) return; // one-shot
+  handoffFired.set(callId, true);
+  const url = `${convexSiteUrl}/twilio-request-handoff?callId=${encodeURIComponent(
+    callId
+  )}&reason=${encodeURIComponent("ivr_human_handoff_detected")}`;
+  console.log(`[handoff] Detected human handoff for callId=${callId} — firing ${url}`);
+  try {
+    const res = await fetch(url, { method: "POST" });
+    console.log(`[handoff] /twilio-request-handoff → ${res.status}`);
+  } catch (err) {
+    console.error(`[handoff] Failed to fire handoff:`, err.message);
+    handoffFired.delete(callId); // allow a retry on the next matching line
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -122,12 +176,19 @@ function cleanupCall(callId) {
     if (call.elevenLabsWs && call.elevenLabsWs.readyState === WebSocket.OPEN) {
       call.elevenLabsWs.close();
     }
+    // Read the handoff flag BEFORE clearing it.
+    const wasHandoff = handoffFired.get(callId) ? true : false;
     activeCalls.delete(callId);
-    console.log(`[cleanup] Call ${callId} cleaned up`);
+    handoffFired.delete(callId);
+    console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
-    // Notify Convex that the call ended so it doesn't stay stuck as in_progress
+    // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
+    // NOTE: when a handoff was fired for this call, the media stream closing is
+    // EXPECTED (Cadence redirected the payer leg into the conference to drop the
+    // AI) — it does NOT mean the whole call ended. We pass wasHandoff so Convex
+    // can distinguish "AI stream closed for handoff" from "call actually over".
     if (CONVEX_SITE_URL && callId) {
-      notifyCallEnded(callId).catch((err) =>
+      notifyCallEnded(callId, wasHandoff).catch((err) =>
         console.error(`[cleanup] Failed to notify Convex:`, err.message)
       );
     }
@@ -137,9 +198,14 @@ function cleanupCall(callId) {
 /**
  * Notify Convex that a call has ended by calling the call-ended HTTP endpoint.
  */
-async function notifyCallEnded(callId) {
-  const url = `${CONVEX_SITE_URL}/call-ended?callId=${encodeURIComponent(callId)}`;
-  console.log(`[cleanup] Notifying Convex call ended: ${callId}`);
+async function notifyCallEnded(callId, wasHandoff = false) {
+  // wasHandoff=true → the AI media stream closed because Cadence redirected the
+  // payer into the conference (handoff in progress), NOT because the call ended.
+  // Convex uses this to avoid marking the call completed prematurely.
+  const url = `${CONVEX_SITE_URL}/call-ended?callId=${encodeURIComponent(callId)}${
+    wasHandoff ? "&handoff=1" : ""
+  }`;
+  console.log(`[cleanup] Notifying Convex call ended: ${callId} (handoff=${wasHandoff})`);
   const res = await fetch(url, { method: "POST" });
   if (!res.ok) {
     console.error(`[cleanup] Convex call-ended returned ${res.status}`);
@@ -416,6 +482,12 @@ function handleMediaStream(ws) {
                   role: "user",
                   text,
                 });
+                // The payer IVR/rep speech comes through as "user". If it
+                // signals a live-rep handoff, notify Convex to broadcast the
+                // call to our agent pool (the AI stays silent per its prompt).
+                if (textSignalsHandoff(text)) {
+                  fireHandoff(callId, CONVEX_SITE_URL, text);
+                }
               }
             }
             break;
