@@ -439,7 +439,12 @@ function handleMediaStream(ws) {
           }
 
           default:
-            console.log(`[ElevenLabs] Unhandled message type: ${message.type}`);
+            // DIAGNOSTIC: dump the full message for any unhandled type so we can
+            // see whether ElevenLabs relays the agent's DTMF (play_keypad_touch_tone)
+            // intent over this WebSocket — the deciding factor for how we inject DTMF.
+            console.log(
+              `[ElevenLabs] Unhandled message type: ${message.type} | full: ${JSON.stringify(message).slice(0, 800)}`
+            );
             break;
         }
       });
