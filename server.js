@@ -34,14 +34,11 @@ let totalWsConnections = 0;
 // ---------------------------------------------------------------------------
 // Human-handoff detection (Option 1: Cadence owns the call).
 //
-// The agent prompt no longer ends the call at handoff — it goes silent. So the
-// BRIDGE detects the moment the payer IVR is about to connect a live rep, by
-// matching the IVR's spoken text, and fires Convex /twilio-request-handoff.
-// Convex then flips the call to awaiting_human and broadcasts it to our agent
-// pool. When an agent accepts, Convex redirects the payer leg into a conference
-// (closing THIS media stream → the AI is dropped) and the human takes over.
+// The bridge must fire only after a real insurance representative speaks.
+// Queue/hold/transfer prompts are still IVR audio; broadcasting on those lines
+// offers the call before any human has answered.
 // ---------------------------------------------------------------------------
-const HANDOFF_PHRASES = [
+const NON_HUMAN_HANDOFF_PHRASES = [
   "please hold",
   "transferring you",
   "transfer you",
@@ -57,13 +54,52 @@ const HANDOFF_PHRASES = [
   "connecting you to the next",
   "hold while we transfer",
   "please stay on the line",
+  "your call is important",
+  "estimated wait time",
+  "wait time",
+  "hold music",
+  "at the tone",
+  "record your message",
+  "voicemail",
+];
+
+const IVR_MENU_PHRASES = [
+  "press ",
+  "press one",
+  "press two",
+  "press three",
+  "press four",
+  "say claims",
+  "say eligibility",
+  "say member services",
+  "to repeat this menu",
+  "for claims",
+  "for eligibility",
+  "for member services",
+  "for provider relations",
+  "to file a new claim",
+  "to speak with",
+];
+
+const LIVE_HUMAN_PATTERNS = [
+  /\bthis is [a-z][a-z .'-]{1,40}\b/i,
+  /\bhow (can|may) i help\b/i,
+  /\bhow can i assist\b/i,
+  /\bwho am i speaking with\b/i,
+  /\bmay i (have|get|verify)\b/i,
+  /\bcan i (have|get|verify)\b/i,
+  /\bclaim(s)? department\b.*\b(help|assist|speaking)\b/i,
+  /\brepresentative\b.*\b(help|assist|speaking)\b/i,
+  /\bthanks? (so much )?for holding\b/i,
 ];
 
 function textSignalsHandoff(text) {
   const t = (text || "").toLowerCase();
-  return HANDOFF_PHRASES.some((p) => t.includes(p));
+  if (!t) return false;
+  if (NON_HUMAN_HANDOFF_PHRASES.some((p) => t.includes(p))) return false;
+  if (IVR_MENU_PHRASES.some((p) => t.includes(p))) return false;
+  return LIVE_HUMAN_PATTERNS.some((p) => p.test(text));
 }
-
 async function fireHandoff(callId, convexSiteUrl, reasonText) {
   if (!callId || !convexSiteUrl) return;
   if (handoffFired.get(callId)) return; // one-shot
