@@ -106,13 +106,17 @@ const LIVE_HUMAN_PATTERNS = [
 function isTransferOrHoldCue(t) {
   return [
     "please hold",
+    "hold music",
     "transferring you",
     "transfer you",
     "connecting you",
     "next available representative",
     "next available agent",
+    "estimated wait time",
+    "wait time",
     "hold while we transfer",
     "please stay on the line",
+    "your call is important",
     "continued patience",
   ].some((p) => t.includes(p));
 }
@@ -165,6 +169,19 @@ async function fireHandoff(callId, convexSiteUrl, reasonText) {
 
 function isHumanHandoffActive(callId) {
   return !!callId && handoffFired.get(callId) === true;
+}
+
+function isPotentialHumanHandoff(callId) {
+  return !!callId && (handoffFired.get(callId) === true || handoffArmed.get(callId) === true);
+}
+
+async function preserveTwilioForPossibleHandoff(callId, cause) {
+  if (!callId || !isPotentialHumanHandoff(callId)) return false;
+  if (!handoffFired.get(callId)) {
+    console.log(`[handoff] ${cause}; firing fallback web handoff for callId=${callId}`);
+    await fireHandoff(callId, CONVEX_SITE_URL, cause);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,14 +638,19 @@ function handleMediaStream(ws) {
 
       elevenLabsWs.on("error", (err) => {
         console.error(`[ElevenLabs] WebSocket error:`, err.message);
+        if (callId && handoffArmed.get(callId) && !handoffFired.get(callId)) {
+          fireHandoff(callId, CONVEX_SITE_URL, "elevenlabs_error_after_transfer_hold").catch((handoffErr) => {
+            console.error(`[handoff] Fallback after ElevenLabs error failed:`, handoffErr.message);
+          });
+        }
       });
 
-      elevenLabsWs.on("close", (code, reason) => {
+      elevenLabsWs.on("close", async (code, reason) => {
         console.log(`[ElevenLabs] Disconnected: ${code} ${reason}`);
         elevenLabsConnected = false;
-        if (isHumanHandoffActive(callId)) {
+        if (await preserveTwilioForPossibleHandoff(callId, "elevenlabs_closed_after_transfer_hold")) {
           console.log(
-            `[ElevenLabs] Closed after handoff for callId=${callId}; leaving Twilio payer leg open for UI accept.`
+            `[ElevenLabs] Closed after possible handoff for callId=${callId}; leaving Twilio payer leg open for UI accept.`
           );
           return;
         }
