@@ -657,6 +657,9 @@ function handleMediaStream(ws) {
             type: "conversation_initiation_client_data",
             dynamic_variables: metadata.dynamic_variables || {},
           };
+          if (metadata.conversation_config_override) {
+            initMessage.conversation_config_override = metadata.conversation_config_override;
+          }
 
           if (elevenLabsConnected && elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
             // ElevenLabs already connected — send init now
