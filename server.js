@@ -10,6 +10,9 @@ const PORT = parseInt(process.env.PORT || "3001", 10);
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL; // e.g. https://groovy-wren-932.convex.site
+const HANDOFF_ON_TRANSFER_CUE = process.env.HANDOFF_ON_TRANSFER_CUE !== "false";
+const DETACH_ELEVENLABS_ON_HANDOFF = process.env.DETACH_ELEVENLABS_ON_HANDOFF !== "false";
+const HOLD_CUE_HANDOFF_DELAY_MS = parseInt(process.env.HOLD_CUE_HANDOFF_DELAY_MS || "8000", 10);
 
 // ---------------------------------------------------------------------------
 // State
@@ -31,6 +34,9 @@ const handoffFired = new Map();
 // callId -> true after the IVR says it is transferring/holding for a rep.
 // Once armed, the next non-IVR human-like utterance triggers handoff.
 const handoffArmed = new Map();
+
+// callId -> timeout handle for delayed hold/music handoff.
+const holdCueTimers = new Map();
 
 // All WebSocket connections for counting
 let totalWsConnections = 0;
@@ -121,50 +127,131 @@ function isTransferOrHoldCue(t) {
   ].some((p) => t.includes(p));
 }
 
+function isRepresentativeTransferCue(t) {
+  return (
+    [
+      "transferring you",
+      "transfer you",
+      "connecting you",
+      "next available representative",
+      "next available agent",
+      "next available claims",
+      "let me get someone",
+      "let me connect you",
+      "connect you to a representative",
+      "connect you with a representative",
+      "connecting you to the next",
+      "hold while we transfer",
+    ].some((p) => t.includes(p)) ||
+    /\b(connect|connecting|transfer|transferring)\b.*\b(representative|agent|specialist|claims department|operator)\b/i.test(t) ||
+    /\b(representative|agent|specialist|operator)\b.*\bwill be with you\b/i.test(t)
+  );
+}
+
 function isSilenceTranscript(t) {
   return !t || t === "..." || t === "." || t === "[silence]";
 }
 
-function textSignalsHandoff(callId, text) {
+function isActionableIvrPrompt(t) {
+  return IVR_MENU_PHRASES.some((p) => t.includes(p));
+}
+
+function handoffSignalFromText(callId, text) {
   const raw = (text || "").trim();
   const t = raw.toLowerCase();
-  if (isSilenceTranscript(t)) return false;
+  if (isSilenceTranscript(t)) return null;
 
   if (isTransferOrHoldCue(t)) {
     if (callId) handoffArmed.set(callId, true);
-    return false;
+    return HANDOFF_ON_TRANSFER_CUE && isRepresentativeTransferCue(t)
+      ? {
+          reason: "ivr_transfer_hold_detected",
+          detachElevenLabs: true,
+        }
+      : null;
   }
 
-  if (NON_HUMAN_HANDOFF_PHRASES.some((p) => t.includes(p))) return false;
-  if (IVR_MENU_PHRASES.some((p) => t.includes(p))) return false;
+  if (NON_HUMAN_HANDOFF_PHRASES.some((p) => t.includes(p))) return null;
+  if (isActionableIvrPrompt(t)) return null;
 
-  if (LIVE_HUMAN_PATTERNS.some((p) => p.test(raw))) return true;
+  if (LIVE_HUMAN_PATTERNS.some((p) => p.test(raw))) {
+    return {
+      reason: "ivr_human_handoff_detected",
+      detachElevenLabs: true,
+    };
+  }
 
   // After the IVR has announced a transfer, the first remaining non-IVR speech
   // is treated as the answered party. This catches call-screening greetings and
   // short human openings before the AI starts the claim conversation.
   if (callId && handoffArmed.get(callId)) {
-    return /\b(hi|hello|yes|yeah|speaking|available)\b/i.test(raw);
+    if (/\b(hi|hello|yes|yeah|speaking|available)\b/i.test(raw)) {
+      return {
+        reason: "ivr_human_handoff_detected",
+        detachElevenLabs: true,
+      };
+    }
   }
 
-  return false;
+  return null;
 }
 async function fireHandoff(callId, convexSiteUrl, reasonText) {
-  if (!callId || !convexSiteUrl) return;
-  if (handoffFired.get(callId)) return; // one-shot
+  if (!callId || !convexSiteUrl) return false;
+  if (handoffFired.get(callId)) return true; // one-shot
   handoffFired.set(callId, true);
+  const reason = reasonText || "ivr_human_handoff_detected";
   const url = `${convexSiteUrl}/twilio-request-handoff?callId=${encodeURIComponent(
     callId
-  )}&reason=${encodeURIComponent("ivr_human_handoff_detected")}`;
-  console.log(`[handoff] Detected human handoff for callId=${callId} — firing ${url}`);
+  )}&reason=${encodeURIComponent(reason)}`;
+  console.log(`[handoff] Detected handoff signal for callId=${callId} reason=${reason} — firing ${url}`);
   try {
     const res = await fetch(url, { method: "POST" });
     console.log(`[handoff] /twilio-request-handoff → ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`/twilio-request-handoff returned ${res.status}`);
+    }
+    return true;
   } catch (err) {
     console.error(`[handoff] Failed to fire handoff:`, err.message);
     handoffFired.delete(callId);
     handoffArmed.delete(callId); // allow a retry on the next matching line
+    return false;
   }
+}
+
+function detachElevenLabsForHandoff(callId, elevenLabsWs, cause) {
+  if (!DETACH_ELEVENLABS_ON_HANDOFF) return;
+  if (!callId || !elevenLabsWs || elevenLabsWs.readyState !== WebSocket.OPEN) return;
+  console.log(
+    `[handoff] Detaching ElevenLabs for callId=${callId}; Twilio payer leg stays open (${cause})`
+  );
+  elevenLabsWs.close(1000, cause || "handoff_detach");
+}
+
+function clearHoldCueTimer(callId) {
+  const timer = holdCueTimers.get(callId);
+  if (timer) {
+    clearTimeout(timer);
+    holdCueTimers.delete(callId);
+  }
+}
+
+function scheduleHoldCueHandoff(callId, elevenLabsWs, reason) {
+  if (!HANDOFF_ON_TRANSFER_CUE) return;
+  if (!callId || handoffFired.get(callId) || holdCueTimers.has(callId)) return;
+  const delayMs = Number.isFinite(HOLD_CUE_HANDOFF_DELAY_MS)
+    ? Math.max(0, HOLD_CUE_HANDOFF_DELAY_MS)
+    : 8000;
+  console.log(`[handoff] Hold cue armed for callId=${callId}; scheduling guard in ${delayMs}ms`);
+  const timer = setTimeout(async () => {
+    holdCueTimers.delete(callId);
+    if (!handoffArmed.get(callId) || handoffFired.get(callId)) return;
+    const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, reason);
+    if (handoffStarted) {
+      detachElevenLabsForHandoff(callId, elevenLabsWs, reason);
+    }
+  }, delayMs);
+  holdCueTimers.set(callId, timer);
 }
 
 function isHumanHandoffActive(callId) {
@@ -271,6 +358,7 @@ function broadcastToListeners(callId, message) {
  * Clean up all resources for a given callId.
  */
 function cleanupCall(callId) {
+  clearHoldCueTimer(callId);
   const call = activeCalls.get(callId);
   if (call) {
     if (call.twilioWs && call.twilioWs.readyState === WebSocket.OPEN) {
@@ -511,7 +599,7 @@ function handleMediaStream(ws) {
         }
       });
 
-      elevenLabsWs.on("message", (data) => {
+      elevenLabsWs.on("message", async (data) => {
         let message;
         try {
           message = JSON.parse(data.toString());
@@ -597,8 +685,19 @@ function handleMediaStream(ws) {
                 // The payer IVR/rep speech comes through as "user". If it
                 // signals a live-rep handoff, notify Convex to broadcast the
                 // call to our agent pool (the AI stays silent per its prompt).
-                if (textSignalsHandoff(callId, text)) {
-                  fireHandoff(callId, CONVEX_SITE_URL, text);
+                const normalizedText = text.toLowerCase();
+                if (isActionableIvrPrompt(normalizedText) && !isTransferOrHoldCue(normalizedText)) {
+                  clearHoldCueTimer(callId);
+                }
+                const handoffSignal = handoffSignalFromText(callId, text);
+                if (handoffSignal) {
+                  clearHoldCueTimer(callId);
+                  const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, handoffSignal.reason);
+                  if (handoffStarted && handoffSignal.detachElevenLabs) {
+                    detachElevenLabsForHandoff(callId, elevenLabsWs, handoffSignal.reason);
+                  }
+                } else if (handoffArmed.get(callId) && isTransferOrHoldCue(normalizedText)) {
+                  scheduleHoldCueHandoff(callId, elevenLabsWs, "ivr_hold_queue_detected");
                 }
               }
             }
@@ -891,4 +990,7 @@ server.listen(PORT, () => {
   console.log(`  POST http://localhost:${PORT}/start-monitor — Start ElevenLabs conversation monitor`);
   console.log(`[cadence-bridge] ElevenLabs Agent ID: ${ELEVENLABS_AGENT_ID || "(not set)"}`);
   console.log(`[cadence-bridge] Convex Site URL: ${CONVEX_SITE_URL || "(not set)"}`);
+  console.log(`[cadence-bridge] HANDOFF_ON_TRANSFER_CUE=${HANDOFF_ON_TRANSFER_CUE}`);
+  console.log(`[cadence-bridge] DETACH_ELEVENLABS_ON_HANDOFF=${DETACH_ELEVENLABS_ON_HANDOFF}`);
+  console.log(`[cadence-bridge] HOLD_CUE_HANDOFF_DELAY_MS=${HOLD_CUE_HANDOFF_DELAY_MS}`);
 });
