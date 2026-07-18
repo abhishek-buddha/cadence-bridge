@@ -163,6 +163,10 @@ async function fireHandoff(callId, convexSiteUrl, reasonText) {
   }
 }
 
+function isHumanHandoffActive(callId) {
+  return !!callId && handoffFired.get(callId) === true;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -504,6 +508,11 @@ function handleMediaStream(ws) {
             break;
 
           case "audio":
+            if (isHumanHandoffActive(callId)) {
+              // After a real payer-side human answers, ElevenLabs is isolated:
+              // it should neither talk over nor influence the human-human call.
+              break;
+            }
             // Check BOTH audio.chunk AND audio_event.audio_base_64 (reference pattern)
             if (message.audio?.chunk) {
               // Send directly to Twilio — NO conversion
@@ -537,6 +546,9 @@ function handleMediaStream(ws) {
             break;
 
           case "interruption":
+            if (isHumanHandoffActive(callId)) {
+              break;
+            }
             if (ws.readyState === WebSocket.OPEN && streamSid) {
               ws.send(JSON.stringify({ event: "clear", streamSid }));
             }
@@ -578,6 +590,9 @@ function handleMediaStream(ws) {
 
           case "agent_response":
           case "agent_response_correction": {
+            if (isHumanHandoffActive(callId)) {
+              break;
+            }
             // Reference uses message.agent_response_event?.agent_response
             const text = (message.agent_response_event?.agent_response || "").trim();
             if (text) {
@@ -611,6 +626,12 @@ function handleMediaStream(ws) {
       elevenLabsWs.on("close", (code, reason) => {
         console.log(`[ElevenLabs] Disconnected: ${code} ${reason}`);
         elevenLabsConnected = false;
+        if (isHumanHandoffActive(callId)) {
+          console.log(
+            `[ElevenLabs] Closed after handoff for callId=${callId}; leaving Twilio payer leg open for UI accept.`
+          );
+          return;
+        }
         // Close Twilio side too
         if (ws.readyState === WebSocket.OPEN) {
           ws.close();
@@ -688,7 +709,7 @@ function handleMediaStream(ws) {
       case "media":
         // Pass audio straight through to ElevenLabs — NO conversion, NO batching
         // Exactly matches reference: Buffer.from(payload, "base64").toString("base64")
-        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
+        if (elevenLabsWs?.readyState === WebSocket.OPEN && !isHumanHandoffActive(callId)) {
           const audioMessage = {
             user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
           };
