@@ -4,6 +4,25 @@ import { WebSocketServer, WebSocket } from "ws";
 import { URL } from "url";
 
 // ---------------------------------------------------------------------------
+// Process-level safety net.
+//
+// This process relays MANY concurrent, independent calls (one per Twilio
+// media-stream connection). Node's default behavior for an uncaught exception
+// or unhandled promise rejection is to crash the ENTIRE process — which would
+// kill every other in-progress call, not just the one that hit a bug. Each
+// call's state lives in its own Map entries, so surviving one call's bug and
+// continuing to serve the rest is the right tradeoff here. Log loudly instead
+// of exiting; per-connection try/catch (see elevenLabsWs.on("message")) should
+// catch most of these before they ever reach here — this is the last resort.
+// ---------------------------------------------------------------------------
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] Uncaught exception (process kept alive):", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] Unhandled promise rejection (process kept alive):", reason);
+});
+
+// ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -37,6 +56,27 @@ const handoffArmed = new Map();
 
 // callId -> timeout handle for delayed hold/music handoff.
 const holdCueTimers = new Map();
+
+// callId -> insuranceContacts.callConnectionType for this call, populated from
+// /call-metadata's dynamic_variables.call_connection_type. The automatic,
+// audio-pattern-based handoff detection below (handoffSignalFromText,
+// scheduleHoldCueHandoff) was built only for the original "ivr_human_handoff"
+// flow (Option 1: Cadence owns the call, bridge detects a human and hands off
+// to a Cadence operator). For "ivr_only_cut_at_handoff" and "direct_to_agent"
+// payers, that behavior is wrong — it silently mutes the AI and requests an
+// operator handoff nobody is there to accept, dropping the call. Those two
+// types are driven entirely by the LLM's own prompt instructions instead (it
+// calls end_call itself, or just keeps talking), so the bridge's own
+// detection must stay out of the way entirely.
+const callConnectionTypes = new Map();
+
+// Whether the bridge's own audio-based auto-handoff detection should run for
+// this call. Defaults to enabled (true) when the type is unset/unknown —
+// matches every payer's behavior before callConnectionType existed.
+function autoHandoffEnabled(callId) {
+  const type = callId ? callConnectionTypes.get(callId) : undefined;
+  return !type || type === "ivr_human_handoff";
+}
 
 // All WebSocket connections for counting
 let totalWsConnections = 0;
@@ -372,6 +412,7 @@ function cleanupCall(callId) {
     activeCalls.delete(callId);
     handoffFired.delete(callId);
     handoffArmed.delete(callId);
+    callConnectionTypes.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
     // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
@@ -607,6 +648,13 @@ function handleMediaStream(ws) {
           return;
         }
 
+        // Isolate per-message handling: this handler is async and runs per
+        // ElevenLabs event for the lifetime of a call, so an uncaught throw
+        // or rejected await anywhere in the switch below would otherwise
+        // become an unhandled promise rejection — which crashes the ENTIRE
+        // Node process (killing every other in-progress call), not just this
+        // one connection. Catch and log instead.
+        try {
         switch (message.type) {
           case "conversation_initiation_metadata":
             console.log(`[ElevenLabs] Received conversation initiation metadata`);
@@ -685,19 +733,25 @@ function handleMediaStream(ws) {
                 // The payer IVR/rep speech comes through as "user". If it
                 // signals a live-rep handoff, notify Convex to broadcast the
                 // call to our agent pool (the AI stays silent per its prompt).
-                const normalizedText = text.toLowerCase();
-                if (isActionableIvrPrompt(normalizedText) && !isTransferOrHoldCue(normalizedText)) {
-                  clearHoldCueTimer(callId);
-                }
-                const handoffSignal = handoffSignalFromText(callId, text);
-                if (handoffSignal) {
-                  clearHoldCueTimer(callId);
-                  const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, handoffSignal.reason);
-                  if (handoffStarted && handoffSignal.detachElevenLabs) {
-                    detachElevenLabsForHandoff(callId, elevenLabsWs, handoffSignal.reason);
+                // Only for callConnectionType "ivr_human_handoff" (default) —
+                // the other types are driven entirely by the LLM's own prompt
+                // instructions, so this automatic detection must stay out of
+                // their way (see autoHandoffEnabled()).
+                if (autoHandoffEnabled(callId)) {
+                  const normalizedText = text.toLowerCase();
+                  if (isActionableIvrPrompt(normalizedText) && !isTransferOrHoldCue(normalizedText)) {
+                    clearHoldCueTimer(callId);
                   }
-                } else if (handoffArmed.get(callId) && isTransferOrHoldCue(normalizedText)) {
-                  scheduleHoldCueHandoff(callId, elevenLabsWs, "ivr_hold_queue_detected");
+                  const handoffSignal = handoffSignalFromText(callId, text);
+                  if (handoffSignal) {
+                    clearHoldCueTimer(callId);
+                    const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, handoffSignal.reason);
+                    if (handoffStarted && handoffSignal.detachElevenLabs) {
+                      detachElevenLabsForHandoff(callId, elevenLabsWs, handoffSignal.reason);
+                    }
+                  } else if (handoffArmed.get(callId) && isTransferOrHoldCue(normalizedText)) {
+                    scheduleHoldCueHandoff(callId, elevenLabsWs, "ivr_hold_queue_detected");
+                  }
                 }
               }
             }
@@ -732,6 +786,12 @@ function handleMediaStream(ws) {
               `[ElevenLabs] Unhandled message type: ${message.type} | full: ${JSON.stringify(message).slice(0, 800)}`
             );
             break;
+        }
+        } catch (err) {
+          console.error(
+            `[ElevenLabs] Error handling message type=${message.type} callId=${callId}:`,
+            err && err.stack ? err.stack : err
+          );
         }
       });
 
@@ -795,6 +855,10 @@ function handleMediaStream(ws) {
         // Fetch metadata from Convex then send init to ElevenLabs
         try {
           const metadata = await fetchCallMetadata(callId);
+          callConnectionTypes.set(
+            callId,
+            metadata.dynamic_variables?.call_connection_type || "ivr_human_handoff"
+          );
           const initMessage = {
             type: "conversation_initiation_client_data",
             dynamic_variables: metadata.dynamic_variables || {},
