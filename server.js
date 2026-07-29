@@ -38,27 +38,6 @@ const handoffArmed = new Map();
 // callId -> timeout handle for delayed hold/music handoff.
 const holdCueTimers = new Map();
 
-// callId -> insuranceContacts.callConnectionType for this call, populated from
-// /call-metadata's dynamic_variables.call_connection_type. The automatic,
-// audio-pattern-based handoff detection below (handoffSignalFromText,
-// scheduleHoldCueHandoff) was built only for the original "ivr_human_handoff"
-// flow (Option 1: Cadence owns the call, bridge detects a human and hands off
-// to a Cadence operator). For "ivr_only_cut_at_handoff" and "direct_to_agent"
-// payers, that behavior is wrong — it silently mutes the AI and requests an
-// operator handoff nobody is there to accept, dropping the call. Those two
-// types are driven entirely by the LLM's own prompt instructions instead (it
-// calls end_call itself, or just keeps talking), so the bridge's own
-// detection must stay out of the way entirely.
-const callConnectionTypes = new Map();
-
-// Whether the bridge's own audio-based auto-handoff detection should run for
-// this call. Defaults to enabled (true) when the type is unset/unknown —
-// matches every payer's behavior before callConnectionType existed.
-function autoHandoffEnabled(callId) {
-  const type = callId ? callConnectionTypes.get(callId) : undefined;
-  return !type || type === "ivr_human_handoff";
-}
-
 // All WebSocket connections for counting
 let totalWsConnections = 0;
 
@@ -393,7 +372,6 @@ function cleanupCall(callId) {
     activeCalls.delete(callId);
     handoffFired.delete(callId);
     handoffArmed.delete(callId);
-    callConnectionTypes.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
     // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
@@ -707,25 +685,19 @@ function handleMediaStream(ws) {
                 // The payer IVR/rep speech comes through as "user". If it
                 // signals a live-rep handoff, notify Convex to broadcast the
                 // call to our agent pool (the AI stays silent per its prompt).
-                // Only for callConnectionType "ivr_human_handoff" (default) —
-                // the other types are driven entirely by the LLM's own prompt
-                // instructions, so this automatic detection must stay out of
-                // their way (see autoHandoffEnabled()).
-                if (autoHandoffEnabled(callId)) {
-                  const normalizedText = text.toLowerCase();
-                  if (isActionableIvrPrompt(normalizedText) && !isTransferOrHoldCue(normalizedText)) {
-                    clearHoldCueTimer(callId);
+                const normalizedText = text.toLowerCase();
+                if (isActionableIvrPrompt(normalizedText) && !isTransferOrHoldCue(normalizedText)) {
+                  clearHoldCueTimer(callId);
+                }
+                const handoffSignal = handoffSignalFromText(callId, text);
+                if (handoffSignal) {
+                  clearHoldCueTimer(callId);
+                  const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, handoffSignal.reason);
+                  if (handoffStarted && handoffSignal.detachElevenLabs) {
+                    detachElevenLabsForHandoff(callId, elevenLabsWs, handoffSignal.reason);
                   }
-                  const handoffSignal = handoffSignalFromText(callId, text);
-                  if (handoffSignal) {
-                    clearHoldCueTimer(callId);
-                    const handoffStarted = await fireHandoff(callId, CONVEX_SITE_URL, handoffSignal.reason);
-                    if (handoffStarted && handoffSignal.detachElevenLabs) {
-                      detachElevenLabsForHandoff(callId, elevenLabsWs, handoffSignal.reason);
-                    }
-                  } else if (handoffArmed.get(callId) && isTransferOrHoldCue(normalizedText)) {
-                    scheduleHoldCueHandoff(callId, elevenLabsWs, "ivr_hold_queue_detected");
-                  }
+                } else if (handoffArmed.get(callId) && isTransferOrHoldCue(normalizedText)) {
+                  scheduleHoldCueHandoff(callId, elevenLabsWs, "ivr_hold_queue_detected");
                 }
               }
             }
@@ -823,10 +795,6 @@ function handleMediaStream(ws) {
         // Fetch metadata from Convex then send init to ElevenLabs
         try {
           const metadata = await fetchCallMetadata(callId);
-          callConnectionTypes.set(
-            callId,
-            metadata.dynamic_variables?.call_connection_type || "ivr_human_handoff"
-          );
           const initMessage = {
             type: "conversation_initiation_client_data",
             dynamic_variables: metadata.dynamic_variables || {},
