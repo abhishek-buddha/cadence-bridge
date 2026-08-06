@@ -361,16 +361,16 @@ async function getElevenLabsSignedUrl() {
  * Forward audio chunk to all browser listeners for a given callId.
  */
 let audioChunkCount = 0;
-function forwardToListeners(callId, payload, track) {
+function forwardToListeners(callId, payload, track, meta = {}) {
   const listeners = browserListeners.get(callId);
   if (!listeners || listeners.size === 0) return;
   audioChunkCount++;
   if (audioChunkCount % 100 === 1) {
-    console.log(`[audio] Forwarding chunk #${audioChunkCount} to ${listeners.size} listener(s) for callId=${callId} track=${track} payload_len=${payload?.length || 0}`);
+    console.log(`[audio] Forwarding chunk #${audioChunkCount} to ${listeners.size} listener(s) for callId=${callId} track=${track} codec=${meta.codec || "mulaw_8000"} source=${meta.source || "twilio"} payload_len=${payload?.length || 0}`);
   }
   const msg = JSON.stringify({
     event: "audio",
-    media: { payload, track },
+    media: { payload, track, ...meta },
   });
   for (const client of listeners) {
     if (client.readyState === WebSocket.OPEN) {
@@ -473,6 +473,7 @@ app.post("/start-monitor", express.json(), async (req, res) => {
   }
 
   const targetConvexUrl = convexSiteUrl || CONVEX_SITE_URL;
+  let agentOutputAudioFormat = null;
   console.log(`[rt-monitor] Starting monitor for conv=${conversationId} call=${callId} convex=${targetConvexUrl}`);
 
   try {
@@ -491,12 +492,19 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         let type = null;
         let message = null;
 
-        // Forward audio events to browser listeners
+        // Forward audio events to browser listeners only when Twilio is not
+        // already supplying call media for this call. ElevenLabs monitor audio
+        // is PCM in the agent output format, while Twilio monitor/media-stream
+        // audio is mu-law 8k. Mixing both sources into /listen causes doubled
+        // and distorted live audio.
         if (msg.type === "audio" || msg.type === "audio_event") {
           receivedAnyEvent = true;
           const audioData = msg.audio?.chunk || msg.audio_event?.audio_base_64 || msg.audio?.data || msg.data;
-          if (audioData) {
-            forwardToListeners(callId, audioData, "outbound");
+          if (audioData && !monitorStreams.has(callId) && !activeCalls.has(callId)) {
+            forwardToListeners(callId, audioData, "outbound", {
+              codec: agentOutputAudioFormat || "pcm_16000",
+              source: "elevenlabs_monitor",
+            });
           }
           return; // Don't forward audio as a call event
         }
@@ -513,6 +521,11 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         } else if (msg.type === "conversation_initiation_metadata") {
           type = "status";
           message = "Call connected";
+          agentOutputAudioFormat =
+            msg.conversation_initiation_metadata_event?.agent_output_audio_format ||
+            msg.conversation_initiation_metadata?.agent_output_audio_format ||
+            msg.agent_output_audio_format ||
+            agentOutputAudioFormat;
         } else {
           // Log unhandled event types for debugging
           console.log(`[rt-monitor] Unhandled event type: ${msg.type} keys: ${Object.keys(msg).join(",")}`);
@@ -530,9 +543,13 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         }
       } catch (parseErr) {
         // Log binary/unparseable messages (could be raw audio)
-        if (data instanceof Buffer && data.length > 100) {
-          // Likely raw audio — forward as base64
-          forwardToListeners(callId, data.toString("base64"), "outbound");
+        if (data instanceof Buffer && data.length > 100 && !monitorStreams.has(callId) && !activeCalls.has(callId)) {
+          // Likely raw audio from the ElevenLabs monitor; label it with the
+          // monitor's output format so the browser does not decode it as mu-law.
+          forwardToListeners(callId, data.toString("base64"), "outbound", {
+            codec: agentOutputAudioFormat || "pcm_16000",
+            source: "elevenlabs_monitor",
+          });
           receivedAnyEvent = true;
         }
       }
@@ -678,7 +695,10 @@ function handleMediaStream(ws) {
               }
               // Forward to browser listeners
               if (callId) {
-                forwardToListeners(callId, message.audio.chunk, "outbound");
+                forwardToListeners(callId, message.audio.chunk, "outbound", {
+                  codec: "mulaw_8000",
+                  source: "media_stream",
+                });
               }
             } else if (message.audio_event?.audio_base_64) {
               // Send directly to Twilio — NO conversion
@@ -691,7 +711,10 @@ function handleMediaStream(ws) {
               }
               // Forward to browser listeners
               if (callId) {
-                forwardToListeners(callId, message.audio_event.audio_base_64, "outbound");
+                forwardToListeners(callId, message.audio_event.audio_base_64, "outbound", {
+                  codec: "mulaw_8000",
+                  source: "media_stream",
+                });
               }
             } else {
               console.log("[ElevenLabs] Received audio but no StreamSid yet");
@@ -903,7 +926,10 @@ function handleMediaStream(ws) {
 
         // Forward to browser listeners (inbound track)
         if (callId) {
-          forwardToListeners(callId, msg.media.payload, "inbound");
+          forwardToListeners(callId, msg.media.payload, "inbound", {
+            codec: "mulaw_8000",
+            source: "media_stream",
+          });
         }
         break;
 
@@ -973,7 +999,10 @@ function handleMonitor(ws) {
       case "media":
         if (callId && msg.media && msg.media.payload) {
           // Forward to all browser listeners for this callId
-          forwardToListeners(callId, msg.media.payload, msg.media.track || "both");
+          forwardToListeners(callId, msg.media.payload, msg.media.track || "both", {
+            codec: "mulaw_8000",
+            source: "twilio_monitor",
+          });
         }
         break;
 
