@@ -929,6 +929,9 @@ function handleMediaStream(ws) {
           forwardToListeners(callId, msg.media.payload, "inbound", {
             codec: "mulaw_8000",
             source: "media_stream",
+            timestamp: msg.media.timestamp,
+            chunk: msg.media.chunk,
+            sequenceNumber: msg.sequenceNumber,
           });
         }
         break;
@@ -1002,6 +1005,9 @@ function handleMonitor(ws) {
           forwardToListeners(callId, msg.media.payload, msg.media.track || "both", {
             codec: "mulaw_8000",
             source: "twilio_monitor",
+            timestamp: msg.media.timestamp,
+            chunk: msg.media.chunk,
+            sequenceNumber: msg.sequenceNumber,
           });
         }
         break;
