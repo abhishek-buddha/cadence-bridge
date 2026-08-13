@@ -9,7 +9,7 @@ import { URL } from "url";
 const PORT = parseInt(process.env.PORT || "3001", 10);
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
-const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL; // e.g. https://groovy-wren-932.convex.site
+const CADENCE_API_BASE_URL = process.env.CADENCE_API_BASE_URL || process.env.CONVEX_SITE_URL;
 
 // ---------------------------------------------------------------------------
 // State
@@ -149,11 +149,11 @@ function textSignalsHandoff(callId, text) {
 
   return false;
 }
-async function fireHandoff(callId, convexSiteUrl, reasonText) {
-  if (!callId || !convexSiteUrl) return;
+async function fireHandoff(callId, apiBaseUrl, reasonText) {
+  if (!callId || !apiBaseUrl) return;
   if (handoffFired.get(callId)) return; // one-shot
   handoffFired.set(callId, true);
-  const url = `${convexSiteUrl}/twilio-request-handoff?callId=${encodeURIComponent(
+  const url = `${apiBaseUrl}/twilio-request-handoff?callId=${encodeURIComponent(
     callId
   )}&reason=${encodeURIComponent("ivr_human_handoff_detected")}`;
   console.log(`[handoff] Detected human handoff for callId=${callId} — firing ${url}`);
@@ -179,7 +179,7 @@ async function preserveTwilioForPossibleHandoff(callId, cause) {
   if (!callId || !isPotentialHumanHandoff(callId)) return false;
   if (!handoffFired.get(callId)) {
     console.log(`[handoff] ${cause}; firing fallback web handoff for callId=${callId}`);
-    await fireHandoff(callId, CONVEX_SITE_URL, cause);
+    await fireHandoff(callId, CADENCE_API_BASE_URL, cause);
   }
   return true;
 }
@@ -192,12 +192,12 @@ async function preserveTwilioForPossibleHandoff(callId, cause) {
  * Fetch call metadata from Convex HTTP endpoint.
  */
 async function fetchCallMetadata(callId) {
-  if (!CONVEX_SITE_URL) {
-    console.warn("[metadata] CONVEX_SITE_URL not set, skipping metadata fetch");
+  if (!CADENCE_API_BASE_URL) {
+    console.warn("[metadata] CADENCE_API_BASE_URL not set, skipping metadata fetch");
     return {};
   }
   try {
-    const url = `${CONVEX_SITE_URL}/call-metadata?callId=${encodeURIComponent(callId)}`;
+    const url = `${CADENCE_API_BASE_URL}/call-metadata?callId=${encodeURIComponent(callId)}`;
     console.log(`[metadata] Fetching: ${url}`);
     const res = await fetch(url);
     if (!res.ok) {
@@ -291,7 +291,7 @@ function cleanupCall(callId) {
     // EXPECTED (Cadence redirected the payer leg into the conference to drop the
     // AI) — it does NOT mean the whole call ended. We pass wasHandoff so Convex
     // can distinguish "AI stream closed for handoff" from "call actually over".
-    if (CONVEX_SITE_URL && callId) {
+    if (CADENCE_API_BASE_URL && callId) {
       notifyCallEnded(callId, wasHandoff).catch((err) =>
         console.error(`[cleanup] Failed to notify Convex:`, err.message)
       );
@@ -306,7 +306,7 @@ async function notifyCallEnded(callId, wasHandoff = false) {
   // wasHandoff=true → the AI media stream closed because Cadence redirected the
   // payer into the conference (handoff in progress), NOT because the call ended.
   // Convex uses this to avoid marking the call completed prematurely.
-  const url = `${CONVEX_SITE_URL}/call-ended?callId=${encodeURIComponent(callId)}${
+  const url = `${CADENCE_API_BASE_URL}/call-ended?callId=${encodeURIComponent(callId)}${
     wasHandoff ? "&handoff=1" : ""
   }`;
   console.log(`[cleanup] Notifying Convex call ended: ${callId} (handoff=${wasHandoff})`);
@@ -338,13 +338,13 @@ app.get("/health", (_req, res) => {
 // to Convex via the /call-events HTTP endpoint.
 // ---------------------------------------------------------------------------
 app.post("/start-monitor", express.json(), async (req, res) => {
-  const { conversationId, callId, convexSiteUrl } = req.body;
+  const { conversationId, callId, apiBaseUrl } = req.body;
   if (!conversationId || !callId) {
     return res.status(400).json({ error: "Missing conversationId or callId" });
   }
 
-  const targetConvexUrl = convexSiteUrl || CONVEX_SITE_URL;
-  console.log(`[rt-monitor] Starting monitor for conv=${conversationId} call=${callId} convex=${targetConvexUrl}`);
+  const targetApiBaseUrl = apiBaseUrl || CADENCE_API_BASE_URL;
+  console.log(`[rt-monitor] Starting monitor for conv=${conversationId} call=${callId} api=${targetApiBaseUrl}`);
 
   try {
     const monitorUrl = `wss://api.elevenlabs.io/v1/convai/conversations/${conversationId}/monitor`;
@@ -390,8 +390,8 @@ app.post("/start-monitor", express.json(), async (req, res) => {
         }
 
         if (type) receivedAnyEvent = true;
-        if (type && targetConvexUrl) {
-          fetch(`${targetConvexUrl}/call-events`, {
+        if (type && targetApiBaseUrl) {
+          fetch(`${targetApiBaseUrl}/call-events`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ callId, type, message }),
@@ -416,8 +416,8 @@ app.post("/start-monitor", express.json(), async (req, res) => {
       console.log(`[rt-monitor] Monitor closed for conv=${conversationId}: ${code} ${reasonStr}`);
       // Only send "Call ended" if we actually received events (monitoring was working)
       // Don't send it if monitoring was rejected (1008) — that's not a real call end
-      if (targetConvexUrl && receivedAnyEvent && code !== 1008) {
-        fetch(`${targetConvexUrl}/call-events`, {
+      if (targetApiBaseUrl && receivedAnyEvent && code !== 1008) {
+        fetch(`${targetApiBaseUrl}/call-events`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ callId, type: "status", message: "Call ended" }),
@@ -598,7 +598,7 @@ function handleMediaStream(ws) {
                 // signals a live-rep handoff, notify Convex to broadcast the
                 // call to our agent pool (the AI stays silent per its prompt).
                 if (textSignalsHandoff(callId, text)) {
-                  fireHandoff(callId, CONVEX_SITE_URL, text);
+                  fireHandoff(callId, CADENCE_API_BASE_URL, text);
                 }
               }
             }
@@ -639,7 +639,7 @@ function handleMediaStream(ws) {
       elevenLabsWs.on("error", (err) => {
         console.error(`[ElevenLabs] WebSocket error:`, err.message);
         if (callId && handoffArmed.get(callId) && !handoffFired.get(callId)) {
-          fireHandoff(callId, CONVEX_SITE_URL, "elevenlabs_error_after_transfer_hold").catch((handoffErr) => {
+          fireHandoff(callId, CADENCE_API_BASE_URL, "elevenlabs_error_after_transfer_hold").catch((handoffErr) => {
             console.error(`[handoff] Fallback after ElevenLabs error failed:`, handoffErr.message);
           });
         }
@@ -890,5 +890,5 @@ server.listen(PORT, () => {
   console.log(`  http://localhost:${PORT}/health            — Health check`);
   console.log(`  POST http://localhost:${PORT}/start-monitor — Start ElevenLabs conversation monitor`);
   console.log(`[cadence-bridge] ElevenLabs Agent ID: ${ELEVENLABS_AGENT_ID || "(not set)"}`);
-  console.log(`[cadence-bridge] Convex Site URL: ${CONVEX_SITE_URL || "(not set)"}`);
+  console.log(`[cadence-bridge] Cadence API Base URL: ${CADENCE_API_BASE_URL || "(not set)"}`);
 });

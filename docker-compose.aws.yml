@@ -1,0 +1,17 @@
+﻿services:
+  cadence-bridge:
+    build: .
+    container_name: cadence-bridge
+    restart: unless-stopped
+    environment:
+      PORT: ${PORT:-3001}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      ELEVENLABS_AGENT_ID: ${ELEVENLABS_AGENT_ID}
+      CADENCE_API_BASE_URL: ${CADENCE_API_BASE_URL:-http://ace-cadence-nginx-1}
+    networks:
+      - ace-cadence
+
+networks:
+  ace-cadence:
+    external: true
+    name: ${ACE_DOCKER_NETWORK:-ace-cadence_default}
