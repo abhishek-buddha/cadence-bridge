@@ -1,0 +1,44 @@
+﻿name: Deploy Ace Cadence Bridge
+
+on:
+  push:
+    branches: [ace-cadence-bridge]
+    paths:
+      - "server.js"
+      - "package*.json"
+      - "Dockerfile"
+      - "docker-compose.aws.yml"
+      - ".env.aws.example"
+      - "ACE_CADENCE_DEPLOY.md"
+      - ".github/workflows/deploy-ace-cadence-bridge.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy bridge to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR=/home/ec2-user/cadence/cadence-bridge
+            REPO=https://github.com/abhishek-buddha/cadence-bridge.git
+            BRANCH=ace-cadence-bridge
+
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone -b "$BRANCH" "$REPO" "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            test -f .env || (echo "Missing $APP_DIR/.env" && exit 1)
+            sudo docker network inspect ace-cadence_default >/dev/null
+            sudo docker compose -f docker-compose.aws.yml up -d --build
+            sudo docker exec cadence-bridge wget -qO- http://127.0.0.1:3001/health
