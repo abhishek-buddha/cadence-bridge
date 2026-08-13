@@ -1,6 +1,7 @@
-﻿name: Deploy Ace Cadence Bridge
+name: Deploy Ace Cadence Bridge
 
 on:
+  workflow_dispatch:
   push:
     branches: [ace-cadence-bridge]
     paths:
