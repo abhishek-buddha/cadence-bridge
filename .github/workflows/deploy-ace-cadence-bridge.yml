@@ -40,6 +40,6 @@ jobs:
             git reset --hard "origin/$BRANCH"
 
             test -f .env || (echo "Missing $APP_DIR/.env" && exit 1)
-            sudo docker network inspect ace-cadence_default >/dev/null
-            sudo docker compose -f docker-compose.aws.yml up -d --build
-            sudo docker exec cadence-bridge wget -qO- http://127.0.0.1:3001/health
+            docker network inspect ace-cadence_default >/dev/null
+            docker compose -f docker-compose.aws.yml up -d --build
+            docker exec cadence-bridge wget -qO- http://127.0.0.1:3001/health
