@@ -140,11 +140,12 @@ function textSignalsHandoff(callId, text) {
 
   if (LIVE_HUMAN_PATTERNS.some((p) => p.test(raw))) return true;
 
-  // After the IVR has announced a transfer, the first remaining non-IVR speech
-  // is treated as the answered party. This catches call-screening greetings and
-  // short human openings before the AI starts the claim conversation.
+  // After the IVR has announced a transfer/hold, it can only be followed by
+  // more hold/IVR audio (already filtered out above) or the real human
+  // picking up. A payer-specific greeting word list here was the bug: any
+  // wording a rep uses that isn't already-known IVR audio must be them.
   if (callId && handoffArmed.get(callId)) {
-    return /\b(hi|hello|yes|yeah|speaking|available)\b/i.test(raw);
+    return true;
   }
 
   return false;
