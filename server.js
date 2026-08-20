@@ -131,7 +131,14 @@ function textSignalsHandoff(callId, text) {
   if (isSilenceTranscript(t)) return false;
 
   if (isTransferOrHoldCue(t)) {
-    if (callId) handoffArmed.set(callId, true);
+    if (callId) {
+      handoffArmed.set(callId, true);
+      // The bridge is the only component that knows when hold began: Cadence's
+      // payer leg is a terminal <Connect><Stream>, so there is no hold-loop
+      // TwiML to measure it from the app side. Without this report,
+      // /reports/hold-metrics has no data at all.
+      reportHoldStart(callId);
+    }
     return false;
   }
 
@@ -150,6 +157,24 @@ function textSignalsHandoff(callId, text) {
 
   return false;
 }
+// callId -> true once we've reported hold start (one-shot; the IVR repeats its
+// hold announcement, and only the first one is the real start of the hold).
+const holdReported = new Map();
+
+async function reportHoldStart(callId) {
+  if (!callId || !CADENCE_API_BASE_URL) return;
+  if (holdReported.get(callId)) return;
+  holdReported.set(callId, true);
+  const url = `${CADENCE_API_BASE_URL}/call-hold-start?callId=${encodeURIComponent(callId)}`;
+  try {
+    const res = await fetch(url, { method: "POST" });
+    console.log(`[hold] /call-hold-start callId=${callId} → ${res.status}`);
+  } catch (err) {
+    console.error(`[hold] Failed to report hold start:`, err.message);
+    holdReported.delete(callId); // let the next hold cue retry
+  }
+}
+
 async function fireHandoff(callId, apiBaseUrl, reasonText) {
   if (!callId || !apiBaseUrl) return;
   if (handoffFired.get(callId)) return; // one-shot
@@ -285,6 +310,7 @@ function cleanupCall(callId) {
     activeCalls.delete(callId);
     handoffFired.delete(callId);
     handoffArmed.delete(callId);
+    holdReported.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
     // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
