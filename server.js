@@ -175,6 +175,40 @@ async function reportHoldStart(callId) {
   }
 }
 
+// callId -> ["role: text", ...]. The bridge is the only place the Mode A
+// transcript exists: the ElevenLabs conversation is opened here via signed URL,
+// so the app never sees it. Without reporting it back, Call History has no
+// transcript to show and the analysis pipeline has nothing to analyse.
+const transcriptLines = new Map();
+
+function recordTranscriptLine(callId, role, text) {
+  if (!callId || !text) return;
+  // Drop the "..." silence markers. They are meaningful live (they show the
+  // agent deliberately holding its tongue during hold) but as stored transcript
+  // they are noise, and this text is fed verbatim to the OpenAI extraction.
+  if (isSilenceTranscript(text.trim().toLowerCase())) return;
+  const lines = transcriptLines.get(callId) || [];
+  lines.push(`${role}: ${text}`);
+  transcriptLines.set(callId, lines);
+}
+
+async function postCallArtifacts(callId, payload) {
+  if (!callId || !CADENCE_API_BASE_URL) return;
+  try {
+    const res = await fetch(
+      `${CADENCE_API_BASE_URL}/call-artifacts?callId=${encodeURIComponent(callId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }
+    );
+    console.log(`[artifacts] /call-artifacts callId=${callId} → ${res.status} (${Object.keys(payload).join(",")})`);
+  } catch (err) {
+    console.error(`[artifacts] Failed to report for callId=${callId}:`, err.message);
+  }
+}
+
 async function fireHandoff(callId, apiBaseUrl, reasonText) {
   if (!callId || !apiBaseUrl) return;
   if (handoffFired.get(callId)) return; // one-shot
@@ -191,10 +225,6 @@ async function fireHandoff(callId, apiBaseUrl, reasonText) {
     handoffFired.delete(callId);
     handoffArmed.delete(callId); // allow a retry on the next matching line
   }
-}
-
-function isHumanHandoffActive(callId) {
-  return !!callId && handoffFired.get(callId) === true;
 }
 
 function isPotentialHumanHandoff(callId) {
@@ -305,12 +335,19 @@ function cleanupCall(callId) {
     if (call.elevenLabsWs && call.elevenLabsWs.readyState === WebSocket.OPEN) {
       call.elevenLabsWs.close();
     }
-    // Read the handoff flag BEFORE clearing it.
+    // Read the handoff flag and transcript BEFORE clearing them.
     const wasHandoff = handoffFired.get(callId) ? true : false;
+    const lines = transcriptLines.get(callId);
+    if (lines && lines.length) {
+      postCallArtifacts(callId, { transcript: lines.join("\n") }).catch((err) =>
+        console.error(`[artifacts] transcript post failed:`, err.message)
+      );
+    }
     activeCalls.delete(callId);
     handoffFired.delete(callId);
     handoffArmed.delete(callId);
     holdReported.delete(callId);
+    transcriptLines.delete(callId);
     console.log(`[cleanup] Call ${callId} cleaned up (wasHandoff=${wasHandoff})`);
 
     // Notify Convex that the call ended so it doesn't stay stuck as in_progress.
@@ -547,16 +584,30 @@ function handleMediaStream(ws) {
         }
 
         switch (message.type) {
-          case "conversation_initiation_metadata":
-            console.log(`[ElevenLabs] Received conversation initiation metadata`);
+          case "conversation_initiation_metadata": {
+            const conversationId =
+              message.conversation_initiation_metadata_event?.conversation_id ||
+              message.conversation_initiation_metadata?.conversation_id ||
+              message.conversation_id;
+            console.log(
+              `[ElevenLabs] Received conversation initiation metadata` +
+                (conversationId ? ` (conversation_id=${conversationId})` : "")
+            );
+            // Store it against the call so the AI-leg recording is playable and
+            // the post-call webhook can correlate by conversation id.
+            if (callId && conversationId) {
+              postCallArtifacts(callId, { conversation_id: conversationId });
+            }
             break;
+          }
 
           case "audio":
-            if (isHumanHandoffActive(callId)) {
-              // After a real payer-side human answers, ElevenLabs is isolated:
-              // it should neither talk over nor influence the human-human call.
-              break;
-            }
+            // NOT gated on handoff-detected any more. The agent must keep
+            // talking to the rep until a Cadence operator actually takes over —
+            // and that moment is the payer leg being redirected into the
+            // conference, which closes this stream and drops the AI on its own.
+            // Cutting it off at *detection* left the rep in silence for however
+            // long it took an operator to accept.
             // Check BOTH audio.chunk AND audio_event.audio_base_64 (reference pattern)
             if (message.audio?.chunk) {
               // Send directly to Twilio — NO conversion
@@ -590,9 +641,6 @@ function handleMediaStream(ws) {
             break;
 
           case "interruption":
-            if (isHumanHandoffActive(callId)) {
-              break;
-            }
             if (ws.readyState === WebSocket.OPEN && streamSid) {
               ws.send(JSON.stringify({ event: "clear", streamSid }));
             }
@@ -615,6 +663,7 @@ function handleMediaStream(ws) {
             const text = (message.user_transcription_event?.user_transcript || "").trim();
             if (text) {
               console.log(`[User] ${text}`);
+              recordTranscriptLine(callId, "payer", text);
               if (callId) {
                 broadcastToListeners(callId, {
                   event: "transcript",
@@ -634,13 +683,11 @@ function handleMediaStream(ws) {
 
           case "agent_response":
           case "agent_response_correction": {
-            if (isHumanHandoffActive(callId)) {
-              break;
-            }
             // Reference uses message.agent_response_event?.agent_response
             const text = (message.agent_response_event?.agent_response || "").trim();
             if (text) {
               console.log(`[Agent] ${text}`);
+              recordTranscriptLine(callId, "agent", text);
               if (callId) {
                 broadcastToListeners(callId, {
                   event: "transcript",
@@ -758,7 +805,10 @@ function handleMediaStream(ws) {
       case "media":
         // Pass audio straight through to ElevenLabs — NO conversion, NO batching
         // Exactly matches reference: Buffer.from(payload, "base64").toString("base64")
-        if (elevenLabsWs?.readyState === WebSocket.OPEN && !isHumanHandoffActive(callId)) {
+        // Keep feeding the rep's audio to the agent after handoff is detected:
+        // without this the agent cannot hear them, so it has nothing to reply to
+        // and the line goes silent while we wait for an operator.
+        if (elevenLabsWs?.readyState === WebSocket.OPEN) {
           const audioMessage = {
             user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
           };
