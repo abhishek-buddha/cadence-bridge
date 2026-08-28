@@ -42,4 +42,26 @@ jobs:
             test -f .env || (echo "Missing $APP_DIR/.env" && exit 1)
             docker network inspect ace-cadence_default >/dev/null
             docker compose -f docker-compose.aws.yml up -d --build
-            docker exec cadence-bridge wget -qO- http://127.0.0.1:3001/health
+
+            # Wait for the app to come up instead of probing it immediately.
+            #
+            # `docker compose up` returns as soon as the container is *started*,
+            # not once Node is listening, so a bare health check raced the boot
+            # and lost: every deploy since 2026-08-13 reported failure with
+            # "wget: can't connect to remote host (127.0.0.1): Connection
+            # refused" roughly 0.1s after "Container cadence-bridge Started" --
+            # while having deployed perfectly well. A permanently red badge
+            # means nobody notices the run that actually breaks.
+            #
+            # On genuine failure, dump the container log: "connection refused"
+            # on its own says nothing about why the process did not start.
+            for i in $(seq 1 15); do
+              if docker exec cadence-bridge wget -qO- http://127.0.0.1:3001/health; then
+                echo "bridge healthy after ${i} attempt(s)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "bridge did not become healthy within 30s"
+            docker logs --tail 50 cadence-bridge
+            exit 1
