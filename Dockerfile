@@ -7,6 +7,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY server.js ./
+COPY appointments.js ./
 
 EXPOSE 3001
 CMD ["npm", "start"]

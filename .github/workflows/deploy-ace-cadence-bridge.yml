@@ -6,6 +6,7 @@ on:
     branches: [ace-cadence-bridge]
     paths:
       - "server.js"
+      - "appointments.js"
       - "package*.json"
       - "Dockerfile"
       - "docker-compose.aws.yml"

@@ -35,6 +35,18 @@ CADENCE_API_BASE_URL=http://ace-cadence-nginx-1
 
 `CADENCE_API_BASE_URL` replaces the old `CONVEX_SITE_URL` name. `CONVEX_SITE_URL` still works as a fallback, so Render is not broken.
 
+## Optional appointment calling
+
+Set `APPOINTMENT_BRIDGE_SECRET` to the same secret as the Ace Cadence app when
+enabling appointment calls. `appointments.js` handles `/appointment-media-stream`
+separately from the existing claims `/media-stream` transport. The app supplies
+the dedicated appointment agent ID after authenticating the individual call.
+Deploy this bridge before enabling the appointment module in the app. Existing
+claims agent IDs and Twilio number settings do not change.
+
+See [the app deployment and rollback guide](https://github.com/abhishek-buddha/cadence/blob/Ace_Cadence/Ace-Cadence/APPOINTMENT_CALLING.md)
+for SQL migration, configuration, testing and removal instructions.
+
 ## Ace-Cadence Env
 
 Set Ace-Cadence to point Twilio streams at the public nginx URL that proxies to this bridge:

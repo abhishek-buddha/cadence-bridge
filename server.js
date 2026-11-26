@@ -2,6 +2,7 @@ import express from "express";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { URL } from "url";
+import { handleAppointmentStream } from './appointments.js';
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -509,7 +510,9 @@ wss.on("connection", (ws, req) => {
   const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
   totalWsConnections++;
 
-  if (pathname === "/media-stream") {
+  if (pathname === '/appointment-media-stream') {
+    handleAppointmentStream(ws, { forwardToListeners, broadcastToListeners });
+  } else if (pathname === "/media-stream") {
     handleMediaStream(ws);
   } else if (pathname === "/monitor") {
     handleMonitor(ws);
