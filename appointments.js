@@ -39,6 +39,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
     if (closed) return;
     closed = true;
     clearInterval(saveTimer);
+    if (callId) broadcastToListeners(callId, { event: 'clear', track: 'outbound' });
     if (agent && agent.readyState < WebSocket.CLOSING) agent.close();
     persist();
   }
@@ -92,6 +93,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
         }
       } else if (msg.type === 'interruption' && twilio.readyState === WebSocket.OPEN) {
         twilio.send(JSON.stringify({ event: 'clear', streamSid }));
+        broadcastToListeners(callId, { event: 'clear', track: 'outbound' });
       } else if (msg.type === 'user_transcript' || msg.type === 'agent_response') {
         const role = msg.type === 'user_transcript' ? 'user' : 'agent';
         const text = role === 'user' ? msg.user_transcription_event?.user_transcript : msg.agent_response_event?.agent_response;
