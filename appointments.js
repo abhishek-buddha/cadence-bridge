@@ -5,6 +5,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
   const base = process.env.CADENCE_API_BASE_URL;
   const secret = process.env.APPOINTMENT_BRIDGE_SECRET;
   let callId, token, streamSid, agent, conversationId;
+  let failureCode;
   let closed = false;
   let patientTurn = 0;
   const transcript = [];
@@ -27,7 +28,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
     if (!callId || !token) return;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await api('artifacts', { conversation_id: conversationId, transcript: transcript.join('\n') });
+        await api('artifacts', { conversation_id: conversationId, transcript: transcript.join('\n'), failure_code: failureCode });
         return;
       } catch (error) {
         if (attempt === 2) console.error('[appointments] Artifact persistence failed:', error.message);
@@ -69,7 +70,10 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
     const response = await fetch(`https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${encodeURIComponent(metadata.agent_id)}`, {
       headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }, signal: AbortSignal.timeout(15000),
     });
-    if (!response.ok) throw new Error('Appointment agent is unavailable');
+    if (!response.ok) {
+      failureCode = 'agent_unavailable';
+      throw new Error('Appointment agent is unavailable');
+    }
     const { signed_url: signedUrl } = await response.json();
     if (closed) return;
     agent = new WebSocket(signedUrl);
@@ -109,6 +113,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
       }
     });
     agent.on('error', () => {
+      failureCode = 'agent_connection_failed';
       console.error('[appointments] Agent connection failed');
       twilio.close();
     });
@@ -119,6 +124,7 @@ export function handleAppointmentStream(twilio, { forwardToListeners, broadcastT
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.event === 'start') start(msg).catch(error => {
+      failureCode ||= 'stream_start_failed';
       console.error('[appointments] Start failed:', error.message);
       twilio.close();
     });
